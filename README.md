@@ -34,12 +34,12 @@ autoskills scan                            # --project NAME, --since 168h, --max
 # 4. review: accept / edit / reject — accepted skills are written to your repos
 autoskills review                          # opens http://127.0.0.1:4517
 
-# always-on mode: auto-scan as sessions finish (macOS launchd service)
+# always-on mode: watches transcript dirs and auto-scans seconds after a session settles
 autoskills install-daemon                  # or run `autoskills daemon` manually
 
 # maintenance
 autoskills garden                          # LLM pass: propose amend/merge/prune → review inbox
-autoskills verify                          # flag skills referencing paths that no longer exist
+autoskills verify                          # flag skills referencing missing or recently-changed paths
 autoskills undo sg_xxx                     # revert an accepted skill (removes the artifact)
 ```
 
@@ -66,7 +66,7 @@ Any OpenAI-compatible endpoint works: OpenAI (`https://api.openai.com/v1`), a co
 
 ## How it decides what to suggest
 
-The distiller hunts for five signal types — user corrections, repeated rediscovery, failure→fix sequences, stated conventions, repeatable workflows — and is heavily quality-gated: most sessions produce zero suggestions, every suggestion must carry verbatim transcript evidence (validated by exact substring match), credential-shaped strings are redacted before any LLM call, and suggestions deduplicate against your existing rules files and prior suggestions.
+The distiller hunts for five signal types — user corrections, repeated rediscovery, failure→fix sequences, stated conventions, repeatable workflows — and is heavily quality-gated: most sessions produce zero suggestions, every suggestion must carry verbatim transcript evidence (validated by exact substring match), credential-shaped strings are redacted before any LLM call, and suggestions deduplicate against your existing rules files and prior suggestions. A cheap deterministic pre-filter runs first: a session with none of those markers is skipped before any LLM call, so the model is only spent on transcripts that actually contain signal.
 
 Accepted skills are placed deliberately (always-on rule vs path-scoped rule vs on-demand skill). In `AGENTS.md` they live inside a single managed section, grouped so related skills read together instead of accumulating chronologically:
 

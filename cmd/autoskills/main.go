@@ -19,12 +19,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
+	"github.com/elcruzo/autoskills/internal/cache"
 	"github.com/elcruzo/autoskills/internal/canon"
 	"github.com/elcruzo/autoskills/internal/collector"
 	"github.com/elcruzo/autoskills/internal/collector/claude"
 	"github.com/elcruzo/autoskills/internal/collector/cursor"
 	"github.com/elcruzo/autoskills/internal/config"
 	"github.com/elcruzo/autoskills/internal/distill"
+	"github.com/elcruzo/autoskills/internal/gitmeta"
 	"github.com/elcruzo/autoskills/internal/llm"
 	"github.com/elcruzo/autoskills/internal/server"
 	"github.com/elcruzo/autoskills/internal/store"
@@ -157,12 +161,20 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 		return fmt.Errorf("no API key: set AUTOSKILLS_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY), or add api_key to %s", config.Path())
 	}
 
+	// Bounded, run-scoped caches (memory stays flat for the always-on daemon):
+	//   seenContent  — model-input hashes already distilled, to skip duplicate LLM calls.
+	//   fingerprints — normalized title+body of stored suggestions, to suppress near-dupes that
+	//                  slip past the exact-title DB check.
+	seenContent := cache.New[string, bool](512)
+	fingerprints := cache.New[string, bool](2048)
+
 	var d *distill.Distiller
 	if !opts.dryRun {
 		d = &distill.Distiller{
 			Client:        llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model),
 			Store:         st,
 			MinConfidence: cfg.MinConfidence,
+			SeenContent:   seenContent,
 		}
 	}
 
@@ -219,10 +231,21 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 				_ = st.SetBytesProcessed(f, info.Size())
 				continue
 			}
+			// Cheap deterministic pre-filter before the LLM: if the transcript shows none of the
+			// correction/convention/failure/rediscovery markers, skip the model entirely. The gate
+			// is conservative (skips only when NOTHING matches), so recall is preserved.
+			kinds, hasSignal := distill.HasSignal(sess)
+			if !hasSignal {
+				if opts.verbose {
+					fmt.Printf("  skip [%s] %s — no distill signal\n", sess.Tool, sess.Project)
+				}
+				_ = st.SetBytesProcessed(f, info.Size())
+				continue
+			}
 
 			if dryRun {
-				fmt.Printf("  would distill: [%s] %s — %d turns (%d user), %dKB\n",
-					sess.Tool, sess.Project, len(sess.Turns), sess.UserTurns(), sess.TextSize()/1024)
+				fmt.Printf("  would distill: [%s] %s — %d turns (%d user), %dKB, signals: %s\n",
+					sess.Tool, sess.Project, len(sess.Turns), sess.UserTurns(), sess.TextSize()/1024, strings.Join(kinds, "+"))
 				distilled++
 				continue
 			}
@@ -252,6 +275,13 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 				if exists {
 					continue
 				}
+				// near-dupe guard beneath the exact-title DB check: catches rephrasings that share
+				// the same normalized title+body but differ in punctuation/casing.
+				fp := fingerprint(g.RepoRoot, g.Title, g.Body)
+				if fingerprints.Contains(fp) {
+					continue
+				}
+				fingerprints.Add(fp, true)
 				// auto-accept tier: high-confidence, non-sensitive suggestions skip the inbox.
 				// Sensitive ones always require human eyes regardless of confidence.
 				if cfg.AutoAcceptThreshold > 0 && g.Confidence >= cfg.AutoAcceptThreshold && !g.Sensitivity {
@@ -291,9 +321,16 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 	return nil
 }
 
-// cmdDaemon runs the always-on loop: a cheap newest-mtime probe every 2 minutes triggers a
-// scan when fresh transcript bytes exist; a full sweep runs every DaemonIntervalMinutes as
-// the safety net. No timers fire any LLM work when there is nothing new.
+// daemonDebounce is how long a transcript dir must be quiet before we distill it. A session file
+// is appended to continuously while a chat is live; waiting for it to settle avoids re-distilling
+// the same growing transcript on every keystroke-flush.
+const daemonDebounce = 3 * time.Second
+
+// cmdDaemon runs the always-on loop. Preferred path: an fsnotify watcher reacts the instant a
+// transcript dir settles (debounced), so new sessions are distilled within seconds at near-zero
+// idle cost. A full sweep every DaemonIntervalMinutes is the safety net. If fsnotify can't be set
+// up (unsupported FS, network mount, descriptor limits, WSL), we fall back to a 2-minute
+// newest-mtime poll — belt and suspenders, never a hard dependency on file events.
 func cmdDaemon(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
@@ -312,8 +349,6 @@ func cmdDaemon(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	fmt.Printf("autoskills daemon — probe every 2m, full sweep every %dm (ctrl-c to stop)\n", cfg.DaemonIntervalMinutes)
-
 	scan := func() {
 		if err := runScan(ctx, cfg, st, scanOptions{since: 720 * time.Hour, maxSessions: 20}); err != nil && ctx.Err() == nil {
 			fmt.Fprintf(os.Stderr, "daemon scan: %v\n", err)
@@ -321,13 +356,112 @@ func cmdDaemon(args []string) error {
 	}
 	scan() // catch up on start
 
+	adapterList, roots := adapters()
+	watcher, watched := newTranscriptWatcher(roots)
+	if watcher == nil {
+		fmt.Printf("autoskills daemon — file events unavailable, polling every 2m (full sweep every %dm)\n", cfg.DaemonIntervalMinutes)
+		return daemonPoll(ctx, scan, cfg, adapterList)
+	}
+	defer watcher.Close()
+	fmt.Printf("autoskills daemon — watching %d dirs, full sweep every %dm (ctrl-c to stop)\n", watched, cfg.DaemonIntervalMinutes)
+	return daemonWatch(ctx, scan, cfg, watcher)
+}
+
+// newTranscriptWatcher builds an fsnotify watcher over every transcript root and its existing
+// subdirectories (fsnotify is not recursive). Returns (nil, 0) if events are unavailable so the
+// caller can fall back to polling. The count is how many dirs are being watched.
+func newTranscriptWatcher(roots map[string]string) (*fsnotify.Watcher, int) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, 0
+	}
+	added := 0
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || !d.IsDir() {
+				return nil
+			}
+			if w.Add(path) == nil {
+				added++
+			}
+			return nil
+		})
+	}
+	if added == 0 {
+		w.Close()
+		return nil, 0
+	}
+	return w, added
+}
+
+// daemonWatch is the event-driven loop: debounce filesystem events, scan once the dust settles,
+// and add newly created project dirs to the watch set.
+func daemonWatch(ctx context.Context, scan func(), cfg config.Config, w *fsnotify.Watcher) error {
+	sweep := time.NewTicker(time.Duration(cfg.DaemonIntervalMinutes) * time.Minute)
+	defer sweep.Stop()
+
+	var debounceTimer *time.Timer
+	var debounceC <-chan time.Time
+	schedule := func() {
+		if debounceTimer != nil {
+			debounceTimer.Stop()
+		}
+		debounceTimer = time.NewTimer(daemonDebounce)
+		debounceC = debounceTimer.C
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("daemon: shutting down")
+			return nil
+		case ev, ok := <-w.Events:
+			if !ok {
+				return nil
+			}
+			// A newly created project directory must join the watch set or its sessions are missed.
+			if ev.Op&fsnotify.Create != 0 {
+				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
+					_ = w.Add(ev.Name)
+				}
+			}
+			if isTranscriptEvent(ev) {
+				schedule()
+			}
+		case err, ok := <-w.Errors:
+			if !ok {
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "daemon watch: %v\n", err)
+		case <-debounceC:
+			debounceC = nil
+			scan()
+		case <-sweep.C:
+			scan()
+		}
+	}
+}
+
+// isTranscriptEvent keeps only writes/creates to transcript files (.jsonl), the content-bearing
+// events; renames/removes and noise files don't trigger a distill.
+func isTranscriptEvent(ev fsnotify.Event) bool {
+	if ev.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+		return false
+	}
+	return strings.HasSuffix(ev.Name, ".jsonl")
+}
+
+// daemonPoll is the fallback loop when file events are unavailable: a cheap newest-mtime probe
+// every 2 minutes triggers a scan when fresh transcript bytes exist; a full sweep is the net.
+func daemonPoll(ctx context.Context, scan func(), cfg config.Config, adapterList []collector.Adapter) error {
 	probe := time.NewTicker(2 * time.Minute)
 	sweep := time.NewTicker(time.Duration(cfg.DaemonIntervalMinutes) * time.Minute)
 	defer probe.Stop()
 	defer sweep.Stop()
 	lastSeen := time.Now()
-
-	adapterList, _ := adapters()
 	for {
 		select {
 		case <-ctx.Done():
@@ -553,23 +687,41 @@ func cmdVerify(args []string) error {
 		return nil
 	}
 
-	stale := 0
+	// changed-set is best-effort provenance: paths touched since the previous commit. A skill that
+	// still references an existing-but-recently-rewritten file may have drifted, so we surface it
+	// as a softer signal than an outright missing path. Only meaningful when a parent commit
+	// exists — on a fresh single-commit repo there is no prior state to have drifted from, and
+	// diffing against the empty tree would mark every tracked file "changed".
+	changed := map[string]bool{}
+	if gitmeta.HasParentCommit(repoRoot) {
+		for _, f := range gitmeta.ChangedFiles(repoRoot) {
+			changed[f] = true
+		}
+	}
+
+	stale, drifted := 0, 0
 	for _, b := range blocks {
-		var missing []string
+		var missing, touched []string
 		for _, ref := range pathRefs(b.Body) {
 			if _, err := os.Stat(filepath.Join(repoRoot, ref)); os.IsNotExist(err) {
 				missing = append(missing, ref)
+			} else if changed[ref] {
+				touched = append(touched, ref)
 			}
 		}
 		if len(missing) > 0 {
 			stale++
 			fmt.Printf("STALE  %s — %s\n       missing: %s\n", b.ID, writer.BlockTitle(b.Body), strings.Join(missing, ", "))
+		} else if len(touched) > 0 {
+			drifted++
+			fmt.Printf("CHANGED %s — %s\n        modified in latest commit: %s\n", b.ID, writer.BlockTitle(b.Body), strings.Join(touched, ", "))
 		}
 	}
-	if stale == 0 {
+	switch {
+	case stale == 0 && drifted == 0:
 		fmt.Printf("verify: all %d skills reference existing paths\n", len(blocks))
-	} else {
-		fmt.Printf("\n%d stale skill(s) — run autoskills garden to propose fixes\n", stale)
+	default:
+		fmt.Printf("\n%d stale, %d possibly-drifted skill(s) — run autoskills garden to propose fixes\n", stale, drifted)
 	}
 	return nil
 }
@@ -632,6 +784,17 @@ func cmdUndo(args []string) error {
 // worthDistilling filters out sessions too small to contain skill-shaped signal.
 func worthDistilling(s *canon.Session) bool {
 	return s.UserTurns() >= 2 && s.TextSize() >= 1500
+}
+
+// fingerprint normalizes a suggestion to a dedupe key: repo + lowercased/whitespace-collapsed
+// title + the first 80 chars of the same normalization of the body.
+func fingerprint(repoRoot, title, body string) string {
+	norm := func(s string) string { return strings.Join(strings.Fields(strings.ToLower(s)), " ") }
+	b := norm(body)
+	if len(b) > 80 {
+		b = b[:80]
+	}
+	return repoRoot + "|" + norm(title) + "|" + b
 }
 
 // ignored enforces the config ignore_projects privacy control: entries match a project name
