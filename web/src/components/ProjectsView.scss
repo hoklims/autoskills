@@ -1,0 +1,64 @@
+.projects-view {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+
+  &__list {
+    list-style: none;
+  }
+
+  &__row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.875rem 1.25rem;
+    border-top: 1px solid var(--color-border);
+
+    &--head {
+      background-color: var(--bg-secondary);
+      border-top: none;
+    }
+  }
+
+  &__label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--color-muted);
+
+    &--right {
+      text-align: right;
+    }
+  }
+
+  &__name {
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--color-dark);
+    overflow-wrap: anywhere;
+  }
+
+  &__path {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-muted);
+    overflow-wrap: anywhere;
+  }
+
+  &__count {
+    justify-self: end;
+    min-width: 26px;
+    padding: 1px 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    text-align: center;
+    color: var(--color-dark);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-full);
+  }
+}

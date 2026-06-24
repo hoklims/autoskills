@@ -1,0 +1,22 @@
+# go
+/autoskills
+*.test
+
+# node
+node_modules/
+web/tsconfig.tsbuildinfo
+
+# the embedded dashboard build is committed so a fresh clone can `go build` without Node.
+# (web/dist is intentionally NOT ignored)
+
+# private — kept local-only, never pushed to the open-source repo
+docs/
+PRD.md
+DESIGN.md
+AGENTS.md
+
+# local
+.DS_Store
+*.log
+.env
+.env.*

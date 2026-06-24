@@ -1,0 +1,715 @@
+// autoskills — turn your AI coding sessions into reviewed, committed skills.
+//
+//	autoskills scan    discover transcripts, distill new sessions into suggestions
+//	autoskills review  open the local review dashboard
+//	autoskills status  discovery report + suggestion counts
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/elcruzo/autoskills/internal/canon"
+	"github.com/elcruzo/autoskills/internal/collector"
+	"github.com/elcruzo/autoskills/internal/collector/claude"
+	"github.com/elcruzo/autoskills/internal/collector/cursor"
+	"github.com/elcruzo/autoskills/internal/config"
+	"github.com/elcruzo/autoskills/internal/distill"
+	"github.com/elcruzo/autoskills/internal/llm"
+	"github.com/elcruzo/autoskills/internal/server"
+	"github.com/elcruzo/autoskills/internal/store"
+	"github.com/elcruzo/autoskills/internal/writer"
+)
+
+const version = "0.1.0"
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	var err error
+	switch os.Args[1] {
+	case "scan":
+		err = cmdScan(os.Args[2:])
+	case "review":
+		err = cmdReview(os.Args[2:])
+	case "status":
+		err = cmdStatus(os.Args[2:])
+	case "daemon":
+		err = cmdDaemon(os.Args[2:])
+	case "install-daemon":
+		err = cmdInstallDaemon(os.Args[2:])
+	case "garden":
+		err = cmdGarden(os.Args[2:])
+	case "verify":
+		err = cmdVerify(os.Args[2:])
+	case "undo":
+		err = cmdUndo(os.Args[2:])
+	case "version", "--version", "-v":
+		fmt.Println("autoskills " + version)
+	case "help", "--help", "-h":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Print(`autoskills — turn your AI coding sessions into reviewed, committed skills
+
+usage:
+  autoskills scan [--project NAME] [--since DUR] [--max N] [--dry-run]
+  autoskills review [--addr HOST:PORT] [--no-open]
+  autoskills daemon                     run continuously: auto-scan as sessions finish
+  autoskills install-daemon [--uninstall]   install as a launchd service (macOS)
+  autoskills garden [--repo PATH]       propose amend/merge/prune for a repo's skills
+  autoskills verify [--repo PATH]       report skills referencing paths that no longer exist
+  autoskills undo ID                    revert an accepted suggestion (removes the artifact)
+  autoskills status
+  autoskills version
+
+scan flags:
+  --project NAME   only scan sessions whose project name contains NAME
+  --since DUR      only sessions modified within DUR (default 720h = 30 days)
+  --max N          max sessions to distill this run (default 20)
+  --dry-run        parse and report; no LLM calls, nothing stored
+
+config: ~/.autoskills/config.json  (endpoint, api_key, model, trigger_phrase,
+        auto_accept_threshold, section_budget_bytes, daemon_interval_minutes, …)
+env:    AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL
+        (falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY)
+`)
+}
+
+func adapters() ([]collector.Adapter, map[string]string) {
+	roots := map[string]string{
+		"cursor": collector.HomePath(".cursor", "projects"),
+		"claude": collector.HomePath(".claude", "projects"),
+	}
+	return []collector.Adapter{cursor.New(roots["cursor"]), claude.New(roots["claude"])}, roots
+}
+
+func cmdScan(args []string) error {
+	fs := flag.NewFlagSet("scan", flag.ExitOnError)
+	project := fs.String("project", "", "only scan sessions whose project name contains this")
+	since := fs.Duration("since", 720*time.Hour, "only sessions modified within this duration")
+	maxSessions := fs.Int("max", 20, "max sessions to distill this run")
+	dryRun := fs.Bool("dry-run", false, "parse and report; no LLM calls")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	return runScan(ctx, cfg, st, scanOptions{
+		project: *project, since: *since, maxSessions: *maxSessions, dryRun: *dryRun, verbose: true,
+	})
+}
+
+type scanOptions struct {
+	project     string
+	since       time.Duration
+	maxSessions int
+	dryRun      bool
+	verbose     bool
+}
+
+// runScan is the shared scan engine used by `scan` and `daemon`.
+func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanOptions) error {
+	writer.SectionBudgetBytes = cfg.SectionBudgetBytes
+
+	adapterList, roots := adapters()
+	if opts.verbose {
+		for _, e := range collector.Discover(adapterList, roots) {
+			fmt.Printf("found %s (%d sessions)\n", e.Tool, e.Sessions)
+		}
+	}
+
+	if !opts.dryRun && cfg.APIKey == "" {
+		return fmt.Errorf("no API key: set AUTOSKILLS_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY), or add api_key to %s", config.Path())
+	}
+
+	var d *distill.Distiller
+	if !opts.dryRun {
+		d = &distill.Distiller{
+			Client:        llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model),
+			Store:         st,
+			MinConfidence: cfg.MinConfidence,
+		}
+	}
+
+	project, maxSessions, dryRun := opts.project, opts.maxSessions, opts.dryRun
+	cutoff := time.Now().Add(-opts.since)
+	// consecutive hard LLM failures (billing, auth) abort the run instead of hammering the endpoint
+	consecutiveFailures := 0
+	distilled, stored := 0, 0
+	for _, a := range adapterList {
+		// the scan cap gates STARTING a session, never truncating a distilled one (a distilled
+		// session's suggestions are always stored in full — its high-water mark has advanced)
+		if distilled >= maxSessions || stored >= cfg.MaxSuggestionsPerScan {
+			break
+		}
+		files, err := a.SessionFiles()
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if distilled >= maxSessions || stored >= cfg.MaxSuggestionsPerScan {
+				break
+			}
+			info, err := os.Stat(f)
+			if err != nil || info.ModTime().Before(cutoff) {
+				continue
+			}
+			processed, err := st.BytesProcessed(f)
+			if err != nil {
+				return err
+			}
+			if processed >= info.Size() {
+				continue // high-water mark: nothing new
+			}
+
+			sess, err := a.Parse(f)
+			if err != nil {
+				// parse failures are deterministic — advance the mark so we don't warn forever
+				fmt.Fprintf(os.Stderr, "  skip %s: %v\n", f, err)
+				_ = st.SetBytesProcessed(f, info.Size())
+				continue
+			}
+			if project != "" && !strings.Contains(strings.ToLower(sess.Project), strings.ToLower(project)) {
+				continue
+			}
+			if ignored(cfg.IgnoreProjects, sess.Project, sess.RepoRoot) {
+				_ = st.SetBytesProcessed(f, info.Size())
+				continue
+			}
+			if cfg.TriggerPhrase != "" && !sess.UserSaid(cfg.TriggerPhrase) {
+				_ = st.SetBytesProcessed(f, info.Size())
+				continue // tuned mode: only distill sessions the user explicitly flagged
+			}
+			if !worthDistilling(sess) {
+				_ = st.SetBytesProcessed(f, info.Size())
+				continue
+			}
+
+			if dryRun {
+				fmt.Printf("  would distill: [%s] %s — %d turns (%d user), %dKB\n",
+					sess.Tool, sess.Project, len(sess.Turns), sess.UserTurns(), sess.TextSize()/1024)
+				distilled++
+				continue
+			}
+
+			fmt.Printf("  distilling [%s] %s (%d turns)…\n", sess.Tool, sess.Project, len(sess.Turns))
+			suggestions, err := d.Session(ctx, sess)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				fmt.Fprintf(os.Stderr, "  distill failed for %s: %v\n", sess.Project, err)
+				consecutiveFailures++
+				if consecutiveFailures >= 3 {
+					return fmt.Errorf("aborting scan after %d consecutive LLM failures (last: %v)", consecutiveFailures, err)
+				}
+				continue // LLM errors are transient: do not advance the mark; retry next scan
+			}
+			consecutiveFailures = 0
+			distilled++
+			_ = st.SetBytesProcessed(f, info.Size())
+
+			for _, g := range suggestions {
+				exists, err := st.TitleExists(g.RepoRoot, g.Title)
+				if err != nil {
+					return err
+				}
+				if exists {
+					continue
+				}
+				// auto-accept tier: high-confidence, non-sensitive suggestions skip the inbox.
+				// Sensitive ones always require human eyes regardless of confidence.
+				if cfg.AutoAcceptThreshold > 0 && g.Confidence >= cfg.AutoAcceptThreshold && !g.Sensitivity {
+					if err := st.InsertSuggestion(g); err != nil {
+						return err
+					}
+					written, werr := writer.Write(g)
+					if werr != nil {
+						fmt.Fprintf(os.Stderr, "    auto-accept write failed for %q: %v (left pending)\n", g.Title, werr)
+						stored++
+						continue
+					}
+					if err := st.Decide(g.ID, "accepted", "", written); err != nil {
+						return err
+					}
+					fmt.Printf("    ✓ auto-accepted %s → %s (undo: autoskills undo %s)\n", g.Title, written, g.ID)
+					continue
+				}
+				if err := st.InsertSuggestion(g); err != nil {
+					return err
+				}
+				stored++
+				fmt.Printf("    + %s (%s, %.0f%%)\n", g.Title, g.Signal, g.Confidence*100)
+			}
+		}
+	}
+
+	if dryRun {
+		fmt.Printf("\ndry run: %d sessions would be distilled\n", distilled)
+		return nil
+	}
+	fmt.Printf("\n%d sessions distilled, %d suggestions stored", distilled, stored)
+	if stored > 0 {
+		fmt.Print(" — run autoskills review")
+	}
+	fmt.Println()
+	return nil
+}
+
+// cmdDaemon runs the always-on loop: a cheap newest-mtime probe every 2 minutes triggers a
+// scan when fresh transcript bytes exist; a full sweep runs every DaemonIntervalMinutes as
+// the safety net. No timers fire any LLM work when there is nothing new.
+func cmdDaemon(args []string) error {
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	fmt.Printf("autoskills daemon — probe every 2m, full sweep every %dm (ctrl-c to stop)\n", cfg.DaemonIntervalMinutes)
+
+	scan := func() {
+		if err := runScan(ctx, cfg, st, scanOptions{since: 720 * time.Hour, maxSessions: 20}); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "daemon scan: %v\n", err)
+		}
+	}
+	scan() // catch up on start
+
+	probe := time.NewTicker(2 * time.Minute)
+	sweep := time.NewTicker(time.Duration(cfg.DaemonIntervalMinutes) * time.Minute)
+	defer probe.Stop()
+	defer sweep.Stop()
+	lastSeen := time.Now()
+
+	adapterList, _ := adapters()
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("daemon: shutting down")
+			return nil
+		case <-probe.C:
+			if newestTranscriptMtime(adapterList).After(lastSeen) {
+				lastSeen = time.Now()
+				scan()
+			}
+		case <-sweep.C:
+			lastSeen = time.Now()
+			scan()
+		}
+	}
+}
+
+func newestTranscriptMtime(adapterList []collector.Adapter) time.Time {
+	var newest time.Time
+	for _, a := range adapterList {
+		files, err := a.SessionFiles() // sorted newest-first
+		if err != nil || len(files) == 0 {
+			continue
+		}
+		if st, err := os.Stat(files[0]); err == nil && st.ModTime().After(newest) {
+			newest = st.ModTime()
+		}
+	}
+	return newest
+}
+
+const launchdLabel = "io.autoskills.daemon"
+
+func cmdInstallDaemon(args []string) error {
+	fs := flag.NewFlagSet("install-daemon", flag.ExitOnError)
+	uninstall := fs.Bool("uninstall", false, "remove the background service")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return installLaunchd(*uninstall)
+	case "linux":
+		return installSystemd(*uninstall)
+	default:
+		return fmt.Errorf("install-daemon supports macOS (launchd) and Linux (systemd --user); on Windows run `autoskills daemon` manually or via Task Scheduler (native service support is on the roadmap)")
+	}
+}
+
+// installSystemd manages a systemd user unit so the daemon runs at login without root.
+func installSystemd(uninstall bool) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	unitPath := filepath.Join(unitDir, "autoskills.service")
+
+	if uninstall {
+		_ = exec.Command("systemctl", "--user", "disable", "--now", "autoskills.service").Run()
+		if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		fmt.Println("daemon uninstalled")
+		return nil
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	unit := fmt.Sprintf(`[Unit]
+Description=autoskills daemon — distill agent sessions into skills
+
+[Service]
+ExecStart=%s daemon
+Restart=on-failure
+Nice=10
+
+[Install]
+WantedBy=default.target
+`, exe)
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+		return err
+	}
+	if out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl daemon-reload: %v: %s", err, out)
+	}
+	if out, err := exec.Command("systemctl", "--user", "enable", "--now", "autoskills.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl enable: %v: %s", err, out)
+	}
+	fmt.Printf("daemon installed (%s)\nlogs: journalctl --user -u autoskills.service\n", unitPath)
+	return nil
+}
+
+func installLaunchd(uninstall bool) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	plistPath := home + "/Library/LaunchAgents/" + launchdLabel + ".plist"
+
+	if uninstall {
+		_ = exec.Command("launchctl", "unload", plistPath).Run()
+		if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		fmt.Println("daemon uninstalled")
+		return nil
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key>
+  <array><string>%s</string><string>daemon</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>%s/.autoskills/daemon.log</string>
+  <key>StandardErrorPath</key><string>%s/.autoskills/daemon.log</string>
+</dict>
+</plist>
+`, launchdLabel, exe, home, home)
+	if err := os.MkdirAll(home+"/.autoskills", 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
+		return err
+	}
+	_ = exec.Command("launchctl", "unload", plistPath).Run() // reload if already installed
+	if out, err := exec.Command("launchctl", "load", plistPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl load: %v: %s", err, out)
+	}
+	fmt.Printf("daemon installed (%s)\nlogs: ~/.autoskills/daemon.log\n", plistPath)
+	return nil
+}
+
+func cmdGarden(args []string) error {
+	fs := flag.NewFlagSet("garden", flag.ExitOnError)
+	repo := fs.String("repo", ".", "repo to garden (default: current directory)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	repoRoot, err := filepath.Abs(*repo)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if cfg.APIKey == "" {
+		return fmt.Errorf("no API key configured")
+	}
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	writer.SectionBudgetBytes = cfg.SectionBudgetBytes
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	d := &distill.Distiller{Client: llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model), Store: st, MinConfidence: cfg.MinConfidence}
+	suggestions, err := d.Garden(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		return err
+	}
+	stored := 0
+	for _, g := range suggestions {
+		// repeated garden runs must not stack duplicate amend/prune items in the inbox
+		exists, err := st.TitleExists(g.RepoRoot, g.Title)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if err := st.InsertSuggestion(g); err != nil {
+			return err
+		}
+		stored++
+		fmt.Printf("  + %s (%.0f%%) — %s\n", g.Title, g.Confidence*100, g.Rationale)
+	}
+	if stored == 0 {
+		fmt.Println("garden: nothing to improve — the skill section is healthy")
+	} else {
+		fmt.Printf("\n%d gardening actions proposed — run autoskills review\n", stored)
+	}
+	return nil
+}
+
+// cmdVerify is the deterministic staleness pass: skills referencing paths that no longer
+// exist in the repo are flagged for gardening. No LLM, no network.
+func cmdVerify(args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	repo := fs.String("repo", ".", "repo to verify (default: current directory)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	repoRoot, err := filepath.Abs(*repo)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(filepath.Join(repoRoot, "AGENTS.md"))
+	if err != nil {
+		return fmt.Errorf("no AGENTS.md in %s", repoRoot)
+	}
+	blocks := writer.ParseBlocks(string(raw))
+	if len(blocks) == 0 {
+		fmt.Println("verify: no managed skills found")
+		return nil
+	}
+
+	stale := 0
+	for _, b := range blocks {
+		var missing []string
+		for _, ref := range pathRefs(b.Body) {
+			if _, err := os.Stat(filepath.Join(repoRoot, ref)); os.IsNotExist(err) {
+				missing = append(missing, ref)
+			}
+		}
+		if len(missing) > 0 {
+			stale++
+			fmt.Printf("STALE  %s — %s\n       missing: %s\n", b.ID, writer.BlockTitle(b.Body), strings.Join(missing, ", "))
+		}
+	}
+	if stale == 0 {
+		fmt.Printf("verify: all %d skills reference existing paths\n", len(blocks))
+	} else {
+		fmt.Printf("\n%d stale skill(s) — run autoskills garden to propose fixes\n", stale)
+	}
+	return nil
+}
+
+var backtickRe = regexp.MustCompile("`([^`\n]+)`")
+
+// pathRefs extracts backticked tokens that look like repo-relative paths.
+func pathRefs(body string) []string {
+	var out []string
+	for _, m := range backtickRe.FindAllStringSubmatch(body, -1) {
+		t := strings.TrimSpace(m[1])
+		// repo-relative path heuristic: has a separator, no spaces/flags/absolute/home/glob
+		if !strings.Contains(t, "/") || strings.ContainsAny(t, " *$~") || strings.HasPrefix(t, "/") || strings.HasPrefix(t, "-") || strings.Contains(t, "://") {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+func cmdUndo(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: autoskills undo <suggestion-id>")
+	}
+	id := args[0]
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	writer.SectionBudgetBytes = cfg.SectionBudgetBytes
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	g, err := st.GetSuggestion(id)
+	if err != nil {
+		return fmt.Errorf("suggestion %s not found", id)
+	}
+	if g.Status != "accepted" {
+		return fmt.Errorf("suggestion %s is %s, not accepted", id, g.Status)
+	}
+	// gardener actions rewrite/remove existing blocks in place — the prior content is gone, so
+	// "undo" cannot restore it and pretending otherwise would be destructive. Honest refusal
+	// until accept-time snapshots land (roadmap v0.6).
+	if g.Tool == "gardener" {
+		return fmt.Errorf("cannot undo gardener action %s: the original block content was replaced at accept time and is not recoverable; restore it from git history of %s", id, g.WrittenPath)
+	}
+	if err := writer.Remove(g); err != nil {
+		return fmt.Errorf("remove artifact: %w", err)
+	}
+	if err := st.Decide(id, "pending", "", ""); err != nil {
+		return err
+	}
+	fmt.Printf("undone: %s — artifact removed, suggestion back in the inbox\n", g.Title)
+	return nil
+}
+
+// worthDistilling filters out sessions too small to contain skill-shaped signal.
+func worthDistilling(s *canon.Session) bool {
+	return s.UserTurns() >= 2 && s.TextSize() >= 1500
+}
+
+// ignored enforces the config ignore_projects privacy control: entries match a project name
+// (case-insensitive) or a repo-root path prefix.
+func ignored(list []string, project, repoRoot string) bool {
+	for _, item := range list {
+		if item == "" {
+			continue
+		}
+		if strings.EqualFold(item, project) {
+			return true
+		}
+		if repoRoot != "" && strings.HasPrefix(repoRoot, item) {
+			return true
+		}
+	}
+	return false
+}
+
+func cmdReview(args []string) error {
+	fs := flag.NewFlagSet("review", flag.ExitOnError)
+	addr := fs.String("addr", server.DefaultAddr, "listen address")
+	noOpen := fs.Bool("no-open", false, "do not open the browser")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	writer.SectionBudgetBytes = cfg.SectionBudgetBytes // dashboard accepts respect the configured budget
+
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	srv := &server.Server{Store: st}
+	url := "http://" + *addr
+	fmt.Printf("autoskills review — %s (ctrl-c to stop)\n", url)
+	if !*noOpen {
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			openBrowser(url)
+		}()
+	}
+	return http.ListenAndServe(*addr, srv.Handler())
+}
+
+func openBrowser(url string) {
+	switch runtime.GOOS {
+	case "darwin":
+		_ = exec.Command("open", url).Start()
+	case "linux":
+		_ = exec.Command("xdg-open", url).Start()
+	case "windows":
+		_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	}
+}
+
+func cmdStatus(args []string) error {
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	adapterList, roots := adapters()
+	for _, e := range collector.Discover(adapterList, roots) {
+		fmt.Printf("%-8s %4d sessions   %s\n", e.Tool, e.Sessions, e.Root)
+	}
+	stats, err := st.Stats()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nsuggestions: %d pending · %d accepted · %d rejected (%d sessions, %d projects)\n",
+		stats.Pending, stats.Accepted, stats.Rejected, stats.Sessions, stats.Projects)
+	return nil
+}

@@ -1,0 +1,39 @@
+.stat-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+
+  &__pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--color-muted);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-full);
+    white-space: nowrap;
+
+    /* keep header tidy on narrow viewports — drop trailing pills */
+    @media (max-width: 768px) {
+      &:nth-child(n + 4) {
+        display: none;
+      }
+    }
+
+    @media (max-width: 480px) {
+      &:nth-child(n + 2) {
+        display: none;
+      }
+    }
+  }
+
+  &__count {
+    color: var(--color-dark);
+    font-weight: 500;
+  }
+}

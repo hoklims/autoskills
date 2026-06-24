@@ -1,0 +1,48 @@
+.app {
+  min-height: 100vh;
+
+  &__shell {
+    display: flex;
+    gap: 2.5rem;
+    max-width: 80rem;
+    margin: 0 auto;
+    padding: 2rem 24px 4rem;
+
+    @media (max-width: 768px) {
+      flex-direction: column;
+      gap: 1.5rem;
+      padding: 1.5rem 16px 3rem;
+    }
+  }
+
+  &__main {
+    flex: 1;
+    min-width: 0;
+    max-width: 48rem;
+    margin: 0 auto;
+  }
+
+  &__cards {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  &__toast {
+    margin-bottom: 1.25rem;
+    padding: 0.625rem 1.25rem;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--bg-primary);
+    background-color: var(--color-dark);
+    border-radius: var(--radius-full);
+    overflow-wrap: anywhere;
+  }
+
+  &__loading {
+    padding: 3rem 0;
+    text-align: center;
+  }
+}

@@ -1,0 +1,215 @@
+.suggestion-card {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  background-color: var(--bg-card);
+  padding: 1.5rem;
+  transition: border-color var(--transition), opacity var(--transition);
+
+  &:hover {
+    border-color: var(--color-border-strong);
+  }
+
+  /* decided cards fade before removal; reduced-motion users get an instant swap via the global override */
+  &--leaving {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  &__badges {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 1rem;
+  }
+
+  &__badge {
+    display: inline-block;
+    padding: 2px 10px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--color-muted);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-full);
+    white-space: nowrap;
+
+    /* sensitivity stays monochrome: inverted ink, no accent */
+    &--inverted {
+      color: var(--bg-primary);
+      background-color: var(--color-dark);
+      border-color: var(--color-dark);
+    }
+  }
+
+  &__project {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--color-subtle);
+  }
+
+  &__title {
+    font-family: var(--font-sans);
+    font-size: 1.125rem;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    line-height: 1.25;
+    color: var(--color-dark);
+  }
+
+  &__rationale {
+    margin-top: 0.5rem;
+    font-family: var(--font-serif);
+    font-size: 0.9375rem;
+    line-height: 1.6;
+    color: var(--color-muted);
+  }
+
+  &__evidence-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-top: 1.25rem;
+  }
+
+  &__evidence-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--color-muted);
+    margin-bottom: 6px;
+  }
+
+  &__excerpt {
+    padding: 0.75rem 1rem;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--color-dark);
+    background-color: var(--bg-secondary);
+    border-radius: var(--radius-sm);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+
+  &__target {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-top: 1.25rem;
+    margin-bottom: 0.5rem;
+  }
+
+  &__target-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--color-muted);
+  }
+
+  &__target-path {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-dark);
+    overflow-wrap: anywhere;
+  }
+
+  &__body {
+    padding: 1rem;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--color-dark);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+
+  &__editor {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    resize: vertical;
+  }
+
+  &__footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin-top: 1.25rem;
+  }
+
+  &__confidence {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  &__confidence-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--color-muted);
+    white-space: nowrap;
+  }
+
+  &__meter {
+    display: inline-block;
+    width: 96px;
+    height: 6px;
+    flex-shrink: 0;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-full);
+    overflow: hidden;
+  }
+
+  &__meter-fill {
+    display: block;
+    height: 100%;
+    background-color: var(--color-dark);
+  }
+
+  &__actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-left: auto;
+  }
+
+  &__btn {
+    padding: 0.5rem 1.25rem;
+  }
+
+  &__reject {
+    padding: 0.5rem 0.75rem;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--color-muted);
+    background: none;
+    border: none;
+    transition: color var(--transition);
+
+    &:hover {
+      color: var(--color-dark);
+    }
+
+    &:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+  }
+}
