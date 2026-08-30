@@ -15,6 +15,7 @@ import { Sidebar, type View } from './components/Sidebar'
 import { SuggestionCard } from './components/SuggestionCard'
 import { ProjectsView } from './components/ProjectsView'
 import { EmptyState } from './components/EmptyState'
+import { InboxIntro } from './components/InboxIntro'
 import './App.scss'
 
 const VIEW_STATUS: Record<Exclude<View, 'projects'>, SuggestionStatus> = {
@@ -146,17 +147,20 @@ export default function App() {
           ) : suggestions.length === 0 ? (
             <EmptyState hint={view} message={EMPTY_COPY[view]} />
           ) : (
-            <div className="app__cards">
-              {suggestions.map((suggestion) => (
-                <SuggestionCard
-                  key={suggestion.id}
-                  suggestion={suggestion}
-                  leaving={leaving.has(suggestion.id)}
-                  readonly={view !== 'inbox'}
-                  onDecision={(action, body) => handleDecision(suggestion.id, action, body)}
-                />
-              ))}
-            </div>
+            <>
+              {view === 'inbox' && <InboxIntro />}
+              <div className="app__cards">
+                {suggestions.map((suggestion) => (
+                  <SuggestionCard
+                    key={suggestion.id}
+                    suggestion={suggestion}
+                    leaving={leaving.has(suggestion.id)}
+                    readonly={view !== 'inbox'}
+                    onDecision={(action, body) => handleDecision(suggestion.id, action, body)}
+                  />
+                ))}
+              </div>
+            </>
           )}
         </main>
       </div>
