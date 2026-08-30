@@ -143,7 +143,7 @@ func uiHandler() http.Handler {
 func placeholderHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, "autoskills: dashboard assets not built. run `pnpm build` in web/ and rebuild the binary.")
+		fmt.Fprintln(w, "autoskills: dashboard assets not built. run `bun run build` in web/ and rebuild the binary.")
 	})
 }
 

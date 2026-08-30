@@ -17,23 +17,25 @@ autoskills serve          # or however you run the Go binary, listening on 127.0
 then:
 
 ```bash
-pnpm install
-pnpm dev                  # http://localhost:5173
+bun install
+bun run dev               # http://localhost:5173
 ```
 
 Without the daemon running, the UI loads but shows a "daemon unreachable" state. For UI work without the daemon, a tiny mock of the API is included:
 
 ```bash
-node mock-api.mjs           # serves fixture data on 127.0.0.1:4517
+bun mock-api.mjs            # serves fixture data on 127.0.0.1:4517
 ```
 
 ## build
 
 ```bash
-pnpm build                # tsc + vite build -> dist/
+bun run build              # tsc + vite build -> dist/
 ```
 
 In production the Go binary serves `dist/` and the API from the same origin, so no proxy is involved.
+
+Dependencies use Bun's isolated linker so `go test ./...` never traverses packages stored under `node_modules`. Bun keeps dependency lifecycle scripts untrusted by default; the dashboard builds without granting additional trust.
 
 ## fonts
 

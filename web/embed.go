@@ -4,7 +4,7 @@ package web
 import "embed"
 
 // Dist holds the Vite build output. A placeholder index lives in dist/ so the Go build succeeds
-// before the frontend has been built; `pnpm build` replaces it.
+// before the frontend has been built; `bun run build` replaces it.
 //
 //go:embed all:dist
 var Dist embed.FS

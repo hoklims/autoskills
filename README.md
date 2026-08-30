@@ -15,7 +15,7 @@ go build -o autoskills ./cmd/autoskills   # from source (Go 1.25+)
 To get the full dashboard UI embedded in the binary, build the frontend first:
 
 ```bash
-cd web && pnpm install && pnpm build && cd ..
+cd web && bun install && bun run build && cd ..
 go build -o autoskills ./cmd/autoskills
 ```
 

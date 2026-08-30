@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AutoSkills — learning control plane",
+    "subtitle": "Cold path local, données non fiables, promotion gouvernée",
+    "output": "autoskills-control-plane.html",
+    "viewBox": [1640, 760]
+  },
+  "components": [
+    { "id": "sources", "type": "external", "label": "Transcripts", "sublabel": "Claude · Codex · Cursor", "pos": [30, 170], "size": [140, 66], "tag": "NON FIABLE" },
+    { "id": "collectors", "type": "backend", "label": "Collectors", "sublabel": "discover + parse", "pos": [220, 170], "size": [140, 66] },
+    { "id": "normalizer", "type": "backend", "label": "Normalizer", "sublabel": "Session versionnée", "pos": [410, 170], "size": [140, 66] },
+    { "id": "redaction", "type": "security", "label": "Local sanitization", "sublabel": "secrets + markers", "pos": [600, 170], "size": [150, 66], "tag": "FAIL CLOSED" },
+    { "id": "signals", "type": "backend", "label": "Signals", "sublabel": "deterministic + explain", "pos": [800, 170], "size": [150, 66] },
+    { "id": "experiences", "type": "database", "label": "Experience Bank", "sublabel": "fingerprint + evidence", "pos": [1000, 170], "size": [150, 66] },
+    { "id": "batch", "type": "messagebus", "label": "Outbound batch", "sublabel": "redact + threshold", "pos": [1200, 170], "size": [150, 66] },
+    { "id": "provider", "type": "external", "label": "LLM provider", "sublabel": "distant ou local", "pos": [1400, 170], "size": [140, 66], "tag": "NON FIABLE" },
+    { "id": "candidate", "type": "backend", "label": "Candidate ops", "sublabel": "NOOP · CREATE · UPDATE", "pos": [1180, 390], "size": [190, 66], "tag": "+ MERGE · DEPRECATE" },
+    { "id": "validation", "type": "security", "label": "Validation + review", "sublabel": "preuve · diff · autorité", "pos": [920, 390], "size": [190, 66], "tag": "HUMAN DEFAULT" },
+    { "id": "registry", "type": "database", "label": "Skill registry", "sublabel": "lifecycle + provenance", "pos": [660, 390], "size": [190, 66] },
+    { "id": "adapters", "type": "backend", "label": "Runtime adapters", "sublabel": "Claude · Codex · Cursor", "pos": [400, 390], "size": [190, 66] },
+    { "id": "outputs", "type": "frontend", "label": "Managed outputs", "sublabel": "native · lazy · reversible", "pos": [140, 390], "size": [190, 66] }
+  ],
+  "boundaries": [
+    { "kind": "security-group", "label": "Entrée non fiable", "wraps": ["sources"], "pad": 18 },
+    { "kind": "region", "label": "Control plane local", "wraps": ["collectors", "normalizer", "redaction", "signals", "experiences", "batch", "candidate", "validation", "registry", "adapters", "outputs"], "pad": 25 },
+    { "kind": "security-group", "label": "Autorité de promotion", "wraps": ["validation", "registry"], "pad": 18 }
+  ],
+  "connections": [
+    { "from": "sources", "to": "collectors", "label": "JSONL", "variant": "security" },
+    { "from": "collectors", "to": "normalizer" },
+    { "from": "normalizer", "to": "redaction" },
+    { "from": "redaction", "to": "signals" },
+    { "from": "signals", "to": "experiences", "variant": "emphasis" },
+    { "from": "experiences", "to": "batch" },
+    { "from": "batch", "to": "provider", "label": "redacted batch", "variant": "security", "labelAt": [1375, 145] },
+    { "from": "provider", "to": "candidate", "label": "proposal", "variant": "security", "fromSide": "bottom", "toSide": "right", "route": "orthogonal-v" },
+    { "from": "candidate", "to": "validation", "variant": "emphasis" },
+    { "from": "validation", "to": "registry", "label": "accepted", "variant": "emphasis" },
+    { "from": "registry", "to": "adapters" },
+    { "from": "adapters", "to": "outputs", "label": "atomic writes", "variant": "emphasis" }
+  ],
+  "cards": [
+    { "dot": "rose", "title": "Trust", "items": ["Transcripts et réponses provider restent non fiables", "La review porte l’autorité de promotion"] },
+    { "dot": "cyan", "title": "Cost", "items": ["Aucun hook LLM sur le hot path", "Filtre déterministe puis batch borné"] },
+    { "dot": "emerald", "title": "Durability", "items": ["Registry canonique séparé des outputs", "Writers atomiques et rollbackables"] }
+  ]
+}
