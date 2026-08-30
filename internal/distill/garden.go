@@ -2,13 +2,13 @@ package distill
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/elcruzo/autoskills/internal/outbound"
 	"github.com/elcruzo/autoskills/internal/store"
 	"github.com/elcruzo/autoskills/internal/writer"
 )
@@ -30,12 +30,12 @@ Respond with ONLY a JSON object, no fences:
 {"actions":[{"type":"amend|prune","block_id":"sg_x","title":"...","body":"...","rationale":"...","confidence":0.0}]}`
 
 type gardenAction struct {
-	Type       string  `json:"type"`
-	BlockID    string  `json:"block_id"`
-	Title      string  `json:"title"`
-	Body       string  `json:"body"`
-	Rationale  string  `json:"rationale"`
-	Confidence float64 `json:"confidence"`
+	Type       string   `json:"type"`
+	BlockID    string   `json:"block_id"`
+	Title      string   `json:"title"`
+	Body       string   `json:"body"`
+	Rationale  string   `json:"rationale"`
+	Confidence *float64 `json:"confidence"`
 }
 
 type gardenResponse struct {
@@ -67,28 +67,51 @@ func (d *Distiller) Garden(ctx context.Context, repoRoot, project string) ([]sto
 		return nil, nil
 	}
 
+	// AGENTS.md is repo content: it can carry a leaked key or an injected marker just like a
+	// transcript. It leaves the machine through the same gate, redacted and neutralized.
 	byID := map[string]writer.Block{}
-	var sb strings.Builder
-	sb.WriteString("REPO: " + repoRoot + "\n\nMANAGED BLOCKS:\n")
+	var ob outbound.Builder
+	ob.Static("REPO: ").Data(repoRoot, maxMetadataBytes)
+	ob.Static("\n\nMANAGED BLOCKS:\n")
 	for _, b := range blocks {
 		byID[b.ID] = b
-		fmt.Fprintf(&sb, "\n[block_id=%s group=%s conf=%.2f]\n%s\n", b.ID, b.Group, b.Confidence, b.Body)
+		ob.Static("\n[block_id=").Data(b.ID, maxMetadataBytes)
+		// group is normalized locally by ParseBlocks and confidence is a parsed float, so both are
+		// already code-owned — they still go through Data(), because "this particular runtime value
+		// happens to be safe" is the reasoning that erodes a single-gate boundary. Static() carries
+		// literals only; no call site interpolates.
+		ob.Static(" group=").Data(b.Group, maxMetadataBytes)
+		ob.Static(" conf=").Data(fmt.Sprintf("%.2f", b.Confidence), maxMetadataBytes)
+		ob.Static("]\n")
+		ob.Data(b.Body, maxBodyBytes)
+		ob.Static("\n")
 	}
-	sb.WriteString("\nTASK: propose amend/prune actions per your system instructions. JSON only.")
+	ob.Static("\nTASK: propose amend/prune actions per your system instructions. JSON only.")
 
-	out, err := d.Client.Chat(ctx, gardenSystemPrompt, sb.String())
+	payload, err := ob.Build(gardenSystemPrompt)
+	if err != nil {
+		return nil, err
+	}
+	out, err := d.Client.Chat(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
 	var resp gardenResponse
-	if err := json.Unmarshal([]byte(extractJSON(out)), &resp); err != nil {
+	if err := decodeStrictJSON(out, &resp, "actions"); err != nil {
 		return nil, fmt.Errorf("garden: unparseable response: %w", err)
 	}
 
 	var result []store.Suggestion
 	for _, a := range resp.Actions {
 		b, known := byID[a.BlockID]
-		if !known || a.Confidence < d.MinConfidence {
+		// closed schema before anything reaches the inbox
+		if err := a.validate(); err != nil {
+			if os.Getenv("AUTOSKILLS_DEBUG") != "" {
+				fmt.Fprintf(os.Stderr, "  drop garden action on %s: %v\n", truncateForLog(a.BlockID), err)
+			}
+			continue
+		}
+		if !known || *a.Confidence < d.MinConfidence {
 			continue
 		}
 		g := store.Suggestion{
@@ -98,7 +121,7 @@ func (d *Distiller) Garden(ctx context.Context, repoRoot, project string) ([]sto
 			Signal:     signalForGroup(b.Group),
 			Scope:      "repo",
 			Placement:  "always_on",
-			Confidence: a.Confidence,
+			Confidence: *a.Confidence,
 			Project:    project,
 			RepoRoot:   repoRoot,
 			TargetPath: "AGENTS.md",
@@ -106,11 +129,8 @@ func (d *Distiller) Garden(ctx context.Context, repoRoot, project string) ([]sto
 			BlockID:    a.BlockID,
 			Tool:       "gardener",
 		}
-		switch a.Type {
+		switch strings.ToLower(strings.TrimSpace(a.Type)) {
 		case "amend":
-			if a.Title == "" || strings.TrimSpace(a.Body) == "" {
-				continue
-			}
 			g.Title = "amend: " + strings.TrimSpace(a.Title)
 			g.Body = strings.TrimSpace(a.Body)
 		case "prune":
@@ -123,6 +143,14 @@ func (d *Distiller) Garden(ctx context.Context, repoRoot, project string) ([]sto
 		default:
 			continue
 		}
+		plan, err := writer.BuildPlan(g)
+		if err != nil {
+			if os.Getenv("AUTOSKILLS_DEBUG") != "" {
+				fmt.Fprintf(os.Stderr, "  drop garden action on %s: %v\n", truncateForLog(a.BlockID), err)
+			}
+			continue
+		}
+		g.TargetPath = plan.Rel
 		result = append(result, g)
 	}
 	return result, nil

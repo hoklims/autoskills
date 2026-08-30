@@ -96,7 +96,9 @@ scan flags:
   --dry-run        parse and report; no LLM calls, nothing stored
 
 config: ~/.autoskills/config.json  (endpoint, api_key, model, trigger_phrase,
-        auto_accept_threshold, section_budget_bytes, daemon_interval_minutes, …)
+        section_budget_bytes, daemon_interval_minutes, …)
+        endpoint must be https, or http on loopback for a local model
+        auto_accept_threshold is DEPRECATED and ignored: nothing is written without review
 env:    AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL
         (falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY)
 `)
@@ -160,6 +162,14 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 	if !opts.dryRun && cfg.APIKey == "" {
 		return fmt.Errorf("no API key: set AUTOSKILLS_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY), or add api_key to %s", config.Path())
 	}
+	// Automatic acceptance was removed (HOK-539): a model-authored file write with no human in the
+	// loop is not a tuning dial. A configured threshold is honoured as "still parses", never as
+	// "still writes" — and the operator is told so on every scan rather than silently ignored.
+	if cfg.AutoAcceptThreshold > 0 {
+		fmt.Fprintf(os.Stderr,
+			"warning: auto_accept_threshold=%.2f in %s is IGNORED — automatic acceptance was removed; every suggestion stays pending until you accept it in `autoskills review`\n",
+			cfg.AutoAcceptThreshold, config.Path())
+	}
 
 	// Bounded, run-scoped caches (memory stays flat for the always-on daemon):
 	//   seenContent  — model-input hashes already distilled, to skip duplicate LLM calls.
@@ -170,8 +180,13 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 
 	var d *distill.Distiller
 	if !opts.dryRun {
+		// endpoint policy is enforced before a client exists: no key travels to an unvetted host
+		client, err := llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model)
+		if err != nil {
+			return err
+		}
 		d = &distill.Distiller{
-			Client:        llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model),
+			Client:        client,
 			Store:         st,
 			MinConfidence: cfg.MinConfidence,
 			SeenContent:   seenContent,
@@ -282,24 +297,8 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 					continue
 				}
 				fingerprints.Add(fp, true)
-				// auto-accept tier: high-confidence, non-sensitive suggestions skip the inbox.
-				// Sensitive ones always require human eyes regardless of confidence.
-				if cfg.AutoAcceptThreshold > 0 && g.Confidence >= cfg.AutoAcceptThreshold && !g.Sensitivity {
-					if err := st.InsertSuggestion(g); err != nil {
-						return err
-					}
-					written, werr := writer.Write(g)
-					if werr != nil {
-						fmt.Fprintf(os.Stderr, "    auto-accept write failed for %q: %v (left pending)\n", g.Title, werr)
-						stored++
-						continue
-					}
-					if err := st.Decide(g.ID, "accepted", "", written); err != nil {
-						return err
-					}
-					fmt.Printf("    ✓ auto-accepted %s → %s (undo: autoskills undo %s)\n", g.Title, written, g.ID)
-					continue
-				}
+				// Every suggestion lands pending. Scanning proposes; only a human accepting in
+				// `autoskills review` writes a file.
 				if err := st.InsertSuggestion(g); err != nil {
 					return err
 				}
@@ -636,7 +635,11 @@ func cmdGarden(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	d := &distill.Distiller{Client: llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model), Store: st, MinConfidence: cfg.MinConfidence}
+	client, err := llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model)
+	if err != nil {
+		return err
+	}
+	d := &distill.Distiller{Client: client, Store: st, MinConfidence: cfg.MinConfidence}
 	suggestions, err := d.Garden(ctx, repoRoot, filepath.Base(repoRoot))
 	if err != nil {
 		return err

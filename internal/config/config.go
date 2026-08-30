@@ -29,9 +29,10 @@ type Config struct {
 	// sessions where the USER typed this phrase (case-insensitive) are distilled —
 	// e.g. "autoskills this". Empty means distill every eligible session.
 	TriggerPhrase string `json:"trigger_phrase"`
-	// AutoAcceptThreshold (0 disables): suggestions at or above this confidence are accepted
-	// and written automatically at scan time. Every auto-accept is reversible via
-	// `autoskills undo <id>`. The other end of the tuning dial from TriggerPhrase.
+	// AutoAcceptThreshold is DEPRECATED and never acted upon (HOK-539). It used to write
+	// high-confidence suggestions to disk at scan time, which let model-authored content become a
+	// file with no human in the loop. The field is still parsed so an existing config keeps
+	// loading; a non-zero value only earns a warning on `scan`. Nothing writes without review.
 	AutoAcceptThreshold float64 `json:"auto_accept_threshold"`
 	// SectionBudgetBytes caps the managed AGENTS.md section (anti-"Markdown poisoning":
 	// context is a finite resource). On overflow the lowest-confidence skills are demoted to
@@ -108,4 +109,3 @@ func Load() (Config, error) {
 	}
 	return cfg, nil
 }
-

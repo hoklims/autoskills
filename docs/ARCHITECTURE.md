@@ -20,7 +20,7 @@ Claude JSONL ─┘                                      │
                                            suggestions SQLite
                                                     │
                                                     v
-                                        review HTTP / auto-accept
+                                     review HTTP (acceptation humaine)
                                                     │
                                                     v
                                   AGENTS.md / .cursor / CLAUDE.md
@@ -31,8 +31,9 @@ Claude JSONL ─┘                                      │
 | `cmd/autoskills` | CLI, orchestration du scan, daemon et installation de service | Plusieurs responsabilités produit et plateforme vivent dans un seul fichier. |
 | `internal/collector` | Découverte et parsing Cursor/Claude vers `canon.Session` | Racines codées depuis le home; pas de collector Codex; résolution Cursor heuristique. |
 | `internal/canon` | Session commune minimale | Les tools, résultats, erreurs, fichiers et outcomes ne forment pas encore un modèle explicite. |
-| `internal/distill` | Préfiltre, redaction partielle, prompt, validation d’evidence, gardening | Une session utile devient directement une suggestion; le contexte existant et le garden peuvent sortir sans redaction. |
-| `internal/llm` | Appel HTTP au format chat completions | Le code suppose une compatibilité OpenAI et mélange les en-têtes de providers. |
+| `internal/distill` | Préfiltre, prompt, validation de schéma et d’evidence, gardening | Une session utile devient directement une suggestion, sans `Experience` intermédiaire. Depuis HOK-539, tout egress (transcript, contexte existant, garden) passe par `internal/outbound`. |
+| `internal/outbound` | Unique préparation du payload provider: redaction, neutralisation des marqueurs, bornes | Frontière de type, pas de sandbox: la redaction reste heuristique. |
+| `internal/llm` | Appel HTTP au format chat completions, policy d’endpoint | Le code suppose une compatibilité OpenAI et mélange les en-têtes de providers. |
 | `internal/store` | SQLite local pour checkpoints et suggestions | Pas de version de schéma ni de transaction unique entre checkpoint et suggestion. |
 | `internal/writer` | Placement et mise à jour des artefacts runtime | Écritures directes, multi-fichiers non atomiques, destinations surtout Cursor, rollback incomplet. |
 | `internal/server` | API locale et UI embarquée | Loopback par défaut, mais exposition possible sans barrière Origin/token/limites. |
@@ -40,12 +41,12 @@ Claude JSONL ─┘                                      │
 
 ## Problèmes structurants
 
-1. **La transcript traverse trop de niveaux de confiance.** Le LLM choisit encore des propriétés qui peuvent mener à une écriture persistante, voire à un script extrait d’un bloc shell.
-2. **L’egress n’a pas une frontière unique.** Les turns sont redacted, mais le contexte du dépôt et le gardener ne passent pas tous par la même policy.
+1. ~~**La transcript traverse trop de niveaux de confiance.**~~ Fermé par HOK-539: le LLM propose uniquement le contenu sémantique; scope, placement, statut et plan d’artefact sont déterminés localement, puis un humain accepte avant toute écriture. Plus aucun script n’est extrait d’un bloc shell.
+2. ~~**L’egress n’a pas une frontière unique.**~~ Fermé par HOK-539: `internal/outbound` est le seul constructeur de payload, et `llm.Client.Chat` n’accepte rien d’autre.
 3. **La persistance n’est pas transactionnelle de bout en bout.** Le checkpoint peut avancer avant l’insertion d’une suggestion; le filesystem et SQLite peuvent diverger.
 4. **La suggestion remplace l’Experience.** Le système ne conserve pas un fait intermédiaire stable, dédupliqué et explicable.
 5. **Le registry et les outputs runtime sont confondus.** Une connaissance canonique devrait précéder les adapters Claude, Codex et Cursor.
-6. **Le support plateforme dépasse la preuve.** L’amont teste seulement Ubuntu; la suite échoue aujourd’hui sous Windows.
+6. **Le support plateforme dépasse encore la CI.** Build, vet et suite Go passent localement sous Windows; l’amont automatise seulement Ubuntu.
 
 ## Architecture cible
 
@@ -164,7 +165,7 @@ CandidateOperation
 ## Preuves et limites actuelles
 
 - `go vet ./...` et `go build ./...` passent sous Windows.
-- `go test ./...` échoue dans `internal/writer` sur une assertion de bit exécutable non portable.
+- l’assertion de bit exécutable non portable d’`internal/writer` a disparu avec la génération de `run.sh` (HOK-539); la preuve d’exécution de `go test ./...` appartient à la revue de cette tranche, pas à ce document.
 - Lint TypeScript et vérification des types passent lorsqu’ils sont lancés directement.
 - Le workflow pnpm échoue sur la policy de builds de dépendances; la migration vers Bun natif 1.4.0 est suivie par HOK-538.
 - La CI amont prouve uniquement Ubuntu au même SHA, sans release ni artefact.

@@ -60,9 +60,11 @@ Config lives at `~/.autoskills/config.json`:
 }
 ```
 
-The automation dial runs in both directions: set `trigger_phrase` (e.g. `"autoskills this"`) to distill only sessions where you typed that phrase, or set `auto_accept_threshold` (e.g. `0.95`) to let high-confidence non-sensitive skills skip the inbox entirely (every auto-accept is reversible with `autoskills undo`). `section_budget_bytes` caps the managed AGENTS.md section — on overflow, the lowest-confidence skills are demoted to on-demand skill files so always-on context never bloats ("Markdown poisoning" defense).
+Set `trigger_phrase` (e.g. `"autoskills this"`) to distill only sessions where you typed that phrase. `section_budget_bytes` caps the managed AGENTS.md section — on overflow, the lowest-confidence skills are demoted to on-demand skill files so always-on context never bloats ("Markdown poisoning" defense).
 
-Any OpenAI-compatible endpoint works: OpenAI (`https://api.openai.com/v1`), a corporate LLM gateway, or local Ollama (`http://localhost:11434/v1`, no key).
+`auto_accept_threshold` is **deprecated and ignored**. It used to write high-confidence suggestions to disk during a scan; a model-authored file with no human in the loop is not a tuning dial, so it was removed. An existing config still loads — a non-zero value only prints a warning on `scan`. Every suggestion stays pending until you accept it in `autoskills review`.
+
+Any OpenAI-compatible endpoint works: OpenAI (`https://api.openai.com/v1`), a corporate LLM gateway, or local Ollama (`http://localhost:11434/v1`, no key). The endpoint must be `https`, or `http` on loopback for a local model — a remote plaintext URL, or one carrying credentials in the URL, is refused before any request is built.
 
 ## How it decides what to suggest
 
@@ -92,13 +94,17 @@ Re-accepting updates a block in place, groups stay sorted, and your hand-written
 - Redacted transcript excerpts → your configured LLM endpoint (and nowhere else)
 - Nothing → us. There is no telemetry, no account, no server in v0.1.
 
+Every dynamic byte in a provider request — transcript turns, your `AGENTS.md`/`CLAUDE.md` context, `.cursor/rules`, managed blocks read by `garden`, project metadata — goes through one preparation step that redacts credential shapes and identity data (API keys, bearer tokens, private keys, connection strings, cloud tokens, `.env` assignments, internal URLs, email addresses) and neutralizes control markers, then redacts the assembled payload once more. A transcript is data: it cannot close its own delimiter, choose a placement, set a status, or cause a write. Provider redirects are refused instead of replaying credentials to a destination you did not configure.
+
+Accepted skills are written as Markdown only. A shell fence inside a skill body stays a fence — AutoSkills never emits an executable file.
+
 ## Platform support
 
 | Platform | Core (scan/review/garden/verify) | Background service |
 |---|---|---|
 | macOS | supported (primary dev platform) | `install-daemon` → launchd |
 | Linux | supported (binary cross-compiles CGO-free; amd64 + arm64) | `install-daemon` → systemd user unit |
-| Windows | compiles and should work (`%USERPROFILE%\.cursor`, `%USERPROFILE%\.claude`) — not yet exercised | run `autoskills daemon` manually / Task Scheduler (native service on the roadmap) |
+| Windows | local build, vet and Go suite pass (`%USERPROFILE%\.cursor`, `%USERPROFILE%\.claude`); CI coverage is still missing | run `autoskills daemon` manually / Task Scheduler (native service on the roadmap) |
 
 WSL note: transcripts written by Windows-side tools live under `/mnt/c/Users/<you>/...` — point `CURSOR_DIR`-style overrides there (first-class WSL detection is on the roadmap).
 

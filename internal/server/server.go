@@ -73,6 +73,10 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if g.Status != "pending" {
+		http.Error(w, "suggestion is no longer pending", http.StatusConflict)
+		return
+	}
 
 	switch req.Action {
 	case "reject":
@@ -84,6 +88,13 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 	case "accept":
 		if req.Body != "" {
 			g.Body = req.Body
+		}
+		// The plan is validated on the body that will actually be written, edits included. A
+		// suggestion whose artifact plan does not resolve is a client error: nothing is written
+		// and the decision is not recorded.
+		if _, err := writer.BuildPlan(g); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		written, err := writer.Write(g)
 		if err != nil {

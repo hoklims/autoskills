@@ -21,8 +21,12 @@ func TestSeenContentSkipsDuplicateLLMCall(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	client, err := llm.New(srv.URL, "", "test-model")
+	if err != nil {
+		t.Fatal(err)
+	}
 	d := &Distiller{
-		Client:      llm.New(srv.URL, "", "test-model"),
+		Client:      client,
 		SeenContent: cache.New[string, bool](16),
 	}
 	s := &canon.Session{

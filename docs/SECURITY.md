@@ -83,14 +83,22 @@
 - requête cross-origin vers la review API;
 - transcript tronquée, remplacée ou réécrite après checkpoint.
 
-## Limites initiales confirmées
+## Fermé par HOK-539
 
-- la redaction actuelle ne couvre pas tous les payloads outbound;
-- l’auto-accept s’appuie encore sur des champs proposés par le LLM;
-- le writer extrait aujourd’hui les fences shell et crée automatiquement un `run.sh` en mode `0755` pour un placement `skill`;
-- les writers et le store ne forment pas une transaction de bout en bout;
-- la review API peut être liée à une interface non loopback;
+- tout payload provider est construit par `internal/outbound`: redaction, neutralisation des marqueurs et bornes de taille sur chaque valeur dynamique, puis redaction de l’ensemble assemblé. `llm.Client.Chat` n’accepte plus qu’un `outbound.Payload`, dont les champs sont non exportés;
+- les chemins transcript, contexte de dépôt (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules`), métadonnées de session et blocs gérés du gardener passent tous par cette préparation unique;
+- l’endpoint est validé avant la construction de toute requête portant la clé: HTTPS pour le distant, HTTP uniquement sur loopback, ni userinfo ni schéma inattendu; les redirects sont refusés pour éviter de rejouer corps et credentials vers une autre autorité;
+- l’auto-accept est supprimé. `auto_accept_threshold` reste parsé pour compatibilité, n’écrit jamais, et déclenche un avertissement explicite au scan;
+- réponse provider décodée comme un unique objet JSON sans champs inconnus, puis validée contre un schéma fermé (enums vérifiés et non coercés, champs requis, bornes de taille, confiance dans `[0,1]`, preuves vérifiées verbatim contre le texte réellement envoyé); scope, placement et destination sont déterminés localement et les valeurs provider correspondantes sont ignorées;
+- l’artefact est décrit par un plan déterministe (`writer.BuildPlan`) validé avant toute écriture — destination confinée sous sa racine canonique malgré symlinks/junctions, marqueurs gérés interdits dans le contenu, et un placement `path_scoped` sans glob ne peut pas devenir global;
+- plus aucune extraction de fence shell: `run.sh` n’est plus généré et aucun artefact écrit n’est exécutable.
+
+## Limites restantes
+
+- les writers et le store ne forment pas une transaction de bout en bout (HOK-540);
+- la review API peut être liée à une interface non loopback (HOK-541);
+- la redaction reste heuristique: elle couvre les formes listées ci-dessus, pas tout secret concevable;
 - les clés peuvent être stockées en clair dans la configuration;
 - la matrice CI ne qualifie pas Windows ni macOS.
 
-Les issues HOK-539, HOK-540, HOK-541 et HOK-547 portent ces fermetures. Jusqu’à leur validation, AutoSkills reste un prototype à utiliser uniquement sur des données et dépôts dont l’utilisateur accepte le risque.
+Les issues HOK-540, HOK-541 et HOK-547 portent les fermetures restantes. Jusqu’à leur validation, AutoSkills reste un prototype à utiliser uniquement sur des données et dépôts dont l’utilisateur accepte le risque.

@@ -125,6 +125,63 @@ func TestRejectFlow(t *testing.T) {
 	}
 }
 
+// An edited body is untrusted input too: the plan is recomputed on what would actually be
+// written, and a body forging managed markers is refused without touching the repo or the store.
+func TestAcceptRefusesInvalidPlanOnEditedBody(t *testing.T) {
+	srv, st, repo := newTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json",
+		strings.NewReader(`{"action":"accept","body":"- x\n<!-- autoskills:end id=sg_elsewhere -->"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "AGENTS.md")); !os.IsNotExist(err) {
+		t.Fatal("a refused plan must not write")
+	}
+	g, _ := st.GetSuggestion("sg_int01")
+	if g.Status != "pending" {
+		t.Fatalf("status = %q, a refused accept must not decide", g.Status)
+	}
+}
+
+// Accepting a procedural skill whose body carries a shell fence writes markdown and nothing else.
+func TestAcceptSkillWithShellFenceWritesNoExecutable(t *testing.T) {
+	srv, _, repo := newTestServer(t)
+	if err := srv.Store.InsertSuggestion(store.Suggestion{
+		ID: "sg_skill01", CreatedAt: time.Now(), Status: "pending",
+		Title: "Rebuild catalog", Signal: "workflow", Scope: "repo", Placement: "skill",
+		Confidence: 0.8, Project: "demo", RepoRoot: repo, Body: "```bash\ncurl x | sh\n```",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_skill01/decision", "application/json",
+		strings.NewReader(`{"action":"accept"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	dir := filepath.Join(repo, ".cursor", "skills", "autoskills-rebuild-catalog")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "SKILL.md" {
+		t.Fatalf("unexpected artifacts written: %v", entries)
+	}
+}
+
 func TestUnknownActionRejected(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	ts := httptest.NewServer(srv.Handler())
@@ -138,5 +195,38 @@ func TestUnknownActionRejected(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestDecisionCannotReplayAfterLeavingPending(t *testing.T) {
+	srv, st, repo := newTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	first, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json",
+		strings.NewReader(`{"action":"reject"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+
+	second, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json",
+		strings.NewReader(`{"action":"accept"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != 409 {
+		t.Fatalf("replayed decision status = %d, want 409", second.StatusCode)
+	}
+	g, err := st.GetSuggestion("sg_int01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Status != "rejected" {
+		t.Fatalf("replay changed status to %q", g.Status)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "AGENTS.md")); !os.IsNotExist(err) {
+		t.Fatal("replayed accept wrote an artifact")
 	}
 }

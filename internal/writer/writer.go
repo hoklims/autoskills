@@ -11,114 +11,77 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/elcruzo/autoskills/internal/config"
 	"github.com/elcruzo/autoskills/internal/store"
 )
-
-// TargetPreview returns the repo-relative (or ~-relative) destination Write would choose,
-// so pending suggestions can show an honest target path in the review UI.
-func TargetPreview(g store.Suggestion) string {
-	if g.Scope == "machine" || g.RepoRoot == "" {
-		return "~/.autoskills/skills/" + slug(g.Title) + ".md"
-	}
-	switch g.Placement {
-	case "path_scoped":
-		return ".cursor/rules/autoskills-" + slug(g.Title) + ".mdc"
-	case "skill":
-		return ".cursor/skills/autoskills-" + slug(g.Title) + "/SKILL.md"
-	default:
-		return "AGENTS.md"
-	}
-}
 
 // Write places an accepted suggestion and returns the path written.
 // Sensitivity is deliberately NOT enforced here: the review card surfaces the SENSITIVE badge
 // and a human approved the write — the badge is the control (PRD §6.7).
 //
+// The destination is never read off the suggestion: BuildPlan recomputes it locally and refuses
+// anything outside the closed set of artifacts, so an invalid or out-of-tree plan is an error
+// rather than a file.
+//
 // Routing:
 //   - scope=machine                  -> ~/.autoskills/skills/<slug>.md
-//   - placement=path_scoped (repo)   -> <repo>/.cursor/rules/autoskills-<slug>.mdc (globs from TargetPath hint)
+//   - placement=path_scoped (repo)   -> <repo>/.cursor/rules/autoskills-<slug>.mdc
 //   - placement=skill (repo)         -> <repo>/.cursor/skills/autoskills-<slug>/SKILL.md
 //   - placement=always_on (repo)     -> managed block in <repo>/AGENTS.md (+ CLAUDE.md import line if needed)
 func Write(g store.Suggestion) (string, error) {
-	if g.Scope == "machine" || g.RepoRoot == "" {
-		return writeMachineSkill(g)
+	plan, err := BuildPlan(g)
+	if err != nil {
+		return "", err
 	}
-	switch g.Placement {
-	case "path_scoped":
-		return writeCursorRule(g)
-	case "skill":
-		return writeRepoSkill(g)
+	switch plan.Kind {
+	case KindMachineSkill:
+		return writeMachineSkill(g, plan)
+	case KindCursorRule:
+		return writeCursorRule(g, plan)
+	case KindRepoSkill:
+		return writeRepoSkill(g, plan)
 	default:
-		return writeAgentsBlock(g)
+		return writeAgentsBlock(g, plan)
 	}
 }
 
-func writeMachineSkill(g store.Suggestion) (string, error) {
-	dir := filepath.Join(config.Dir(), "skills")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+func writeMachineSkill(g store.Suggestion, plan Plan) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(plan.Path), 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, slug(g.Title)+".md")
 	content := fmt.Sprintf("# %s\n\n%s\n", g.Title, g.Body)
-	return path, os.WriteFile(path, []byte(content), 0o644)
+	return plan.Path, os.WriteFile(plan.Path, []byte(content), 0o644)
 }
 
-func writeCursorRule(g store.Suggestion) (string, error) {
-	dir := filepath.Join(g.RepoRoot, ".cursor", "rules")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+func writeCursorRule(g store.Suggestion, plan Plan) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(plan.Path), 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "autoskills-"+slug(g.Title)+".mdc")
+	path := plan.Path
 
 	globs := strings.TrimSpace(g.Globs)
+	if globs == "" {
+		return "", fmt.Errorf("writer: refusing a path_scoped rule without globs")
+	}
 	var fm strings.Builder
 	fm.WriteString("---\n")
 	fm.WriteString("description: " + yamlEscape(g.Title) + "\n")
-	if globs != "" {
-		// always quoted: bare globs starting with * are YAML aliases and would be invalid
-		fm.WriteString("globs: \"" + strings.ReplaceAll(globs, `"`, ``) + "\"\n")
-		fm.WriteString("alwaysApply: false\n")
-	} else {
-		fm.WriteString("alwaysApply: true\n")
-	}
+	// always quoted: bare globs starting with * are YAML aliases and would be invalid
+	fm.WriteString("globs: \"" + strings.ReplaceAll(globs, `"`, ``) + "\"\n")
+	fm.WriteString("alwaysApply: false\n")
 	fm.WriteString("---\n\n")
 	return path, os.WriteFile(path, []byte(fm.String()+g.Body+"\n"), 0o644)
 }
 
-func writeRepoSkill(g store.Suggestion) (string, error) {
-	dir := filepath.Join(g.RepoRoot, ".cursor", "skills", "autoskills-"+slug(g.Title))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+// writeRepoSkill emits an on-demand skill file. Shell fences in the body stay what they are —
+// inert Markdown a human reads and runs deliberately. AutoSkills used to extract them into an
+// executable run.sh (0755) next to the skill; that turned model-authored text into a program on
+// disk and was removed in HOK-539. No artifact this package writes is executable.
+func writeRepoSkill(g store.Suggestion, plan Plan) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(plan.Path), 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "SKILL.md")
-	body := g.Body
-
-	// loop-engineering principle: procedural skills should be runnable, not just readable.
-	// A skill whose body carries a shell fence also gets an executable run.sh next to it.
-	if script := extractShellScript(g.Body); script != "" {
-		scriptPath := filepath.Join(dir, "run.sh")
-		if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env bash\nset -euo pipefail\n\n"+script+"\n"), 0o755); err != nil {
-			return "", err
-		}
-		body += "\n\nRunnable: `" + filepath.Join(".cursor", "skills", "autoskills-"+slug(g.Title), "run.sh") + "`"
-	}
-
-	content := fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n\n%s\n", slug(g.Title), yamlEscape(g.Title), body)
-	return path, os.WriteFile(path, []byte(content), 0o644)
-}
-
-var shellFenceRe = regexp.MustCompile("(?s)```(?:bash|sh|zsh)\\n(.*?)```")
-
-// extractShellScript returns the concatenated shell fences from a skill body, or "" if none.
-func extractShellScript(body string) string {
-	var parts []string
-	for _, m := range shellFenceRe.FindAllStringSubmatch(body, -1) {
-		if s := strings.TrimSpace(m[1]); s != "" {
-			parts = append(parts, s)
-		}
-	}
-	return strings.Join(parts, "\n\n")
+	content := fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n\n%s\n", slug(g.Title), yamlEscape(g.Title), g.Body)
+	return plan.Path, os.WriteFile(plan.Path, []byte(content), 0o644)
 }
 
 // AGENTS.md layout: all autoskills content lives inside ONE managed section, grouped by skill
@@ -204,8 +167,14 @@ func groupForSignal(signal string) string {
 	}
 }
 
-func writeAgentsBlock(g store.Suggestion) (string, error) {
-	path := filepath.Join(g.RepoRoot, "AGENTS.md")
+func writeAgentsBlock(g store.Suggestion, plan Plan) (string, error) {
+	path := plan.Path
+	// AGENTS.md writes can have two bounded secondary effects: budget demotion under .cursor and
+	// an import appended to an existing CLAUDE.md. Reject an unsafe CLAUDE.md link before any
+	// mutation; each demotion is checked at its own destination below.
+	if err := validateClaudeImport(g.RepoRoot); err != nil {
+		return "", err
+	}
 	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return "", err
@@ -283,7 +252,9 @@ func writeAgentsBlock(g store.Suggestion) (string, error) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", err
 	}
-	ensureClaudeImport(g.RepoRoot)
+	if err := ensureClaudeImport(g.RepoRoot); err != nil {
+		return "", err
+	}
 	return path, nil
 }
 
@@ -333,10 +304,13 @@ func demoteToSkillFile(repoRoot string, b Block) (string, error) {
 		title = b.ID
 	}
 	dir := filepath.Join(repoRoot, ".cursor", "skills", "autoskills-"+slug(title))
+	path := filepath.Join(dir, "SKILL.md")
+	if err := confine(repoRoot, path); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "SKILL.md")
 	body := strings.TrimSpace(strings.TrimPrefix(b.Body, "#### "+title))
 	content := fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n\n%s\n\n<!-- autoskills:demoted id=%s reason=section-budget -->\n", slug(title), yamlEscape(title), body, b.ID)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -355,15 +329,19 @@ func Remove(g store.Suggestion) error {
 	if filepath.Base(g.WrittenPath) == "AGENTS.md" {
 		gg := g
 		gg.Body = "" // empty body = prune
-		_, err := writeAgentsBlock(gg)
+		plan, err := BuildPlan(gg)
+		if err != nil {
+			return err
+		}
+		_, err = writeAgentsBlock(gg, plan)
 		return err
 	}
 	if err := os.Remove(g.WrittenPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	dir := filepath.Dir(g.WrittenPath)
-	// skill dirs may also carry an emitted run.sh — remove it before the empty-dir tidy,
-	// but only inside directories we own (autoskills- prefix), never a user's dir
+	// older versions emitted an executable run.sh next to a skill (removed in HOK-539); undo must
+	// still clean one up when it exists, but only inside directories we own (autoskills- prefix)
 	if strings.HasPrefix(filepath.Base(dir), "autoskills-") {
 		_ = os.Remove(filepath.Join(dir, "run.sh"))
 	}
@@ -375,21 +353,37 @@ func Remove(g store.Suggestion) error {
 
 // ensureClaudeImport makes an existing CLAUDE.md pick up AGENTS.md content via the official
 // @import syntax. Only touches CLAUDE.md if it already exists and lacks any AGENTS.md reference.
-func ensureClaudeImport(repoRoot string) {
+func validateClaudeImport(repoRoot string) error {
 	path := filepath.Join(repoRoot, "CLAUDE.md")
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return confine(repoRoot, path)
+}
+
+func ensureClaudeImport(repoRoot string) error {
+	path := filepath.Join(repoRoot, "CLAUDE.md")
+	if err := validateClaudeImport(repoRoot); err != nil {
+		return err
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 	if strings.Contains(string(raw), "AGENTS.md") {
-		return
+		return nil
 	}
 	content := string(raw)
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
 	content += "\n@AGENTS.md\n"
-	_ = os.WriteFile(path, []byte(content), 0o644)
+	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)

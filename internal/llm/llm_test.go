@@ -1,0 +1,169 @@
+package llm
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/elcruzo/autoskills/internal/outbound"
+)
+
+func TestValidateEndpointPolicy(t *testing.T) {
+	ok := []string{
+		"https://api.anthropic.com/v1",
+		"https://gateway.corp.example.com:8443/openai/v1",
+		"http://localhost:11434/v1",
+		"http://127.0.0.1:11434/v1",
+		"http://[::1]:11434/v1",
+	}
+	for _, e := range ok {
+		if err := ValidateEndpoint(e); err != nil {
+			t.Errorf("endpoint %q must be accepted: %v", e, err)
+		}
+	}
+
+	bad := []string{
+		"http://api.example.com/v1",            // plaintext to a remote host
+		"http://10.0.0.5:8080/v1",              // private, but still not loopback
+		"https://user:hunter2@api.example.com", // credentials smuggled in the URL
+		"http://127.0.0.1@evil.example.com/v1", // loopback-looking userinfo, remote host
+		"ftp://api.example.com/v1",
+		"file:///tmp/whatever",
+		"https://",
+		"://nonsense",
+		"",
+		"https://api.example.com/v1#fragment",
+	}
+	for _, e := range bad {
+		if err := ValidateEndpoint(e); err == nil {
+			t.Errorf("endpoint %q must be rejected", e)
+		}
+	}
+}
+
+func TestNewRejectsUnvettedEndpoint(t *testing.T) {
+	if _, err := New("http://api.example.com/v1", "sk-secret", "m"); err == nil {
+		t.Fatal("New must refuse a plaintext remote endpoint")
+	}
+	c, err := New("https://api.anthropic.com/v1/", "sk-secret", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Endpoint != "https://api.anthropic.com/v1" {
+		t.Fatalf("endpoint not normalized: %q", c.Endpoint)
+	}
+}
+
+type recordingTransport struct {
+	calls int
+}
+
+func (rt *recordingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	rt.calls++
+	return &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"{}"}}]}`)),
+		Header:     http.Header{},
+	}, nil
+}
+
+func TestChatRefusesUnvettedEndpointBeforeAnyRequest(t *testing.T) {
+	rt := &recordingTransport{}
+	// built as a struct literal on purpose: the guard must live on the request path, not only in New
+	c := &Client{Endpoint: "http://api.example.com/v1", APIKey: "sk-secret", Model: "m", HTTP: &http.Client{Transport: rt}}
+
+	var b outbound.Builder
+	b.Static("hello")
+	p, err := b.Build("system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Chat(context.Background(), p); err == nil {
+		t.Fatal("Chat must refuse an unvetted endpoint")
+	}
+	if rt.calls != 0 {
+		t.Fatalf("a request carrying the API key was issued anyway (%d calls)", rt.calls)
+	}
+}
+
+// TestChatBodyCarriesOnlyThePayload inspects the exact bytes on the wire.
+func TestChatBodyCarriesOnlyThePayload(t *testing.T) {
+	var gotBody []byte
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	c, err := New(srv.URL, "sk-secret", "test-model") // httptest binds loopback: http is allowed
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b outbound.Builder
+	b.Static("PROJECT: ").Data("demo", 100)
+	b.Static("\nkey: ").Data("sk-ant-api03-cccccccccccccccccccccccc", 0)
+	p, err := b.Build("system prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.Chat(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "ok" {
+		t.Fatalf("unexpected content %q", out)
+	}
+	if gotAuth != "Bearer sk-secret" {
+		t.Fatalf("auth header = %q", gotAuth)
+	}
+	if strings.Contains(string(gotBody), "sk-ant-api03-cccccccccccccccccccccccc") {
+		t.Fatalf("secret reached the request body:\n%s", gotBody)
+	}
+	var sent chatRequest
+	if err := json.Unmarshal(gotBody, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent.Messages) != 2 || sent.Messages[0].Content != p.System() || sent.Messages[1].Content != p.User() {
+		t.Fatalf("body is not the prepared payload: %+v", sent.Messages)
+	}
+}
+
+func TestChatDoesNotFollowRedirects(t *testing.T) {
+	unsafeCalls := 0
+	unsafeAuth := ""
+	unsafe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		unsafeCalls++
+		unsafeAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer unsafe.Close()
+
+	entry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, unsafe.URL, http.StatusTemporaryRedirect)
+	}))
+	defer entry.Close()
+
+	c, err := New(entry.URL, "sk-secret", "test-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b outbound.Builder
+	b.Static("hello")
+	p, err := b.Build("system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Chat(context.Background(), p); err == nil {
+		t.Fatal("redirected provider response must be refused")
+	}
+	if unsafeCalls != 0 || unsafeAuth != "" {
+		t.Fatalf("redirect target received %d requests with auth %q", unsafeCalls, unsafeAuth)
+	}
+}
