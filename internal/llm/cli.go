@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/elcruzo/autoskills/internal/outbound"
 )
@@ -187,7 +188,7 @@ func (p *cliProvider) run(ctx context.Context, dir string, args []string, stdin 
 	}
 	if err != nil {
 		sanitizedStderr := outbound.Sanitize(stderr.String())
-		detail := safeCLIDetail(sanitizedStderr)
+		detail := safeCLIDetail(sanitizedStderr, stdin)
 		if looksUnauthenticated(detail) {
 			return nil, fmt.Errorf("%w: %s", ErrNotAuthenticated, p.kind)
 		}
@@ -453,7 +454,7 @@ func pathWithin(root, target string) bool {
 	return relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
-func safeCLIDetail(stderr string) string {
+func safeCLIDetail(stderr, prompt string) string {
 	lines := strings.Split(stderr, "\n")
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -462,18 +463,37 @@ func safeCLIDetail(stderr string) string {
 		}
 		encoded := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(trimmed, `"message":`)), ",")
 		var message string
-		if json.Unmarshal([]byte(encoded), &message) == nil {
+		if json.Unmarshal([]byte(encoded), &message) == nil && !detailContainsPromptData(message, prompt) {
 			return limitRunes(message, 500)
 		}
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		trimmed := strings.TrimSpace(lines[i])
 		lower := strings.ToLower(trimmed)
-		if strings.Contains(lower, "error") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "authentication") || strings.Contains(lower, "not logged in") {
+		if (strings.Contains(lower, "error") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "authentication") || strings.Contains(lower, "not logged in")) && !detailContainsPromptData(trimmed, prompt) {
 			return limitRunes(trimmed, 500)
 		}
 	}
 	return ""
+}
+
+func detailContainsPromptData(detail, prompt string) bool {
+	promptTokens := make(map[string]struct{})
+	for _, token := range textTokens(prompt) {
+		promptTokens[token] = struct{}{}
+	}
+	for _, token := range textTokens(detail) {
+		if _, present := promptTokens[token]; present {
+			return true
+		}
+	}
+	return false
+}
+
+func textTokens(value string) []string {
+	return strings.FieldsFunc(strings.ToLower(value), func(character rune) bool {
+		return !unicode.IsLetter(character) && !unicode.IsNumber(character)
+	})
 }
 
 func limitRunes(value string, limit int) string {

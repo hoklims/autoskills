@@ -84,6 +84,15 @@ func TestCLIHelper(t *testing.T) {
 	case "request-error":
 		_, _ = fmt.Fprint(os.Stderr, "SYSTEM INSTRUCTIONS:\nsystem instruction\nUSER MESSAGE:\nauthentication required in private prompt\nERROR: {\n  \"error\": {\n    \"message\": \"schema rejected\"\n  }\n}\n")
 		os.Exit(8)
+	case "prompt-error":
+		_, _ = fmt.Fprint(os.Stderr, "Error: private-customer-project-codename")
+		os.Exit(8)
+	case "prompt-json-error":
+		_, _ = fmt.Fprint(os.Stderr, `"message": "private-customer-project-codename"`)
+		os.Exit(8)
+	case "short-prompt-error":
+		_, _ = fmt.Fprint(os.Stderr, "Error: x7")
+		os.Exit(8)
 	case "large":
 		large := strings.Repeat("x", maxCLIOutputBytes+1)
 		if output := argumentValue(args, "--output-last-message"); output != "" {
@@ -561,6 +570,34 @@ func TestCLIErrorKeepsCauseWithoutEchoingPrompt(t *testing.T) {
 				t.Fatalf("prompt text caused false authentication classification: %v", err)
 			}
 			if strings.Contains(err.Error(), "SYSTEM INSTRUCTIONS") || strings.Contains(err.Error(), "private prompt") {
+				t.Fatalf("error echoed prompt: %v", err)
+			}
+		})
+	}
+}
+
+func TestCLIErrorDoesNotEchoPromptFragments(t *testing.T) {
+	for _, tc := range []struct {
+		behavior string
+		prompt   string
+	}{
+		{behavior: "prompt-error", prompt: "private-customer-project-codename"},
+		{behavior: "prompt-json-error", prompt: "private-customer-project-codename"},
+		{behavior: "short-prompt-error", prompt: "x7"},
+	} {
+		t.Run(tc.behavior, func(t *testing.T) {
+			t.Setenv("AUTOSKILLS_CLI_HELPER", tc.behavior)
+			var builder outbound.Builder
+			builder.Data(tc.prompt, 0)
+			payload, err := builder.BuildWithOutputSchema("system", testOutputSchema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), payload)
+			if err == nil || !strings.Contains(err.Error(), "exited non-zero") {
+				t.Fatalf("error = %v", err)
+			}
+			if strings.Contains(err.Error(), tc.prompt) {
 				t.Fatalf("error echoed prompt: %v", err)
 			}
 		})
