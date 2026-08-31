@@ -30,10 +30,16 @@ type helperInvocation struct {
 	CodexHomeMode    uint32   `json:"codex_home_mode,omitempty"`
 	SystemPrompt     string   `json:"system_prompt,omitempty"`
 	EnvironmentLeaks []string `json:"environment_leaks,omitempty"`
+	// AutoSkillsNames is every AUTOSKILLS_* variable the child can see, by name. A named list
+	// would only prove the absence of names someone remembered to write down.
+	AutoSkillsNames []string `json:"autoskills_names,omitempty"`
+	// PathPresent proves the child kept the environment it needs to run: an empty environment
+	// would pass every absence assertion above while breaking the provider.
+	PathPresent bool `json:"path_present,omitempty"`
 }
 
 func TestCLIHelper(t *testing.T) {
-	if os.Getenv("AUTOSKILLS_CLI_HELPER") == "" {
+	if os.Getenv("TEST_CLI_HELPER_BEHAVIOR") == "" {
 		return
 	}
 	separator := -1
@@ -73,8 +79,19 @@ func TestCLIHelper(t *testing.T) {
 			environmentLeaks = append(environmentLeaks, name)
 		}
 	}
-	invocation, _ := json.Marshal(helperInvocation{Args: args, Dir: dir, Stdin: string(stdin), CodexHome: codexHome, CodexAuthTarget: codexAuthTarget, CodexAuthRegular: codexAuthRegular, CodexHomeMode: codexHomeMode, SystemPrompt: systemPrompt, EnvironmentLeaks: environmentLeaks})
-	switch os.Getenv("AUTOSKILLS_CLI_HELPER") {
+	var autoSkillsNames []string
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(name), "AUTOSKILLS_") {
+			autoSkillsNames = append(autoSkillsNames, name)
+		}
+	}
+	_, pathPresent := os.LookupEnv("PATH")
+	if !pathPresent {
+		_, pathPresent = os.LookupEnv("Path") // Windows preserves the case it was given
+	}
+	invocation, _ := json.Marshal(helperInvocation{Args: args, Dir: dir, Stdin: string(stdin), CodexHome: codexHome, CodexAuthTarget: codexAuthTarget, CodexAuthRegular: codexAuthRegular, CodexHomeMode: codexHomeMode, SystemPrompt: systemPrompt, EnvironmentLeaks: environmentLeaks, AutoSkillsNames: autoSkillsNames, PathPresent: pathPresent})
+	switch os.Getenv("TEST_CLI_HELPER_BEHAVIOR") {
 	case "exit":
 		_, _ = fmt.Fprint(os.Stderr, "authentication required")
 		os.Exit(7)
@@ -139,16 +156,19 @@ func TestCLIHelper(t *testing.T) {
 		time.Sleep(5 * time.Second)
 	case "spawn-child":
 		child := exec.Command(os.Args[0], "-test.run=TestCLIHelper", "--")
-		child.Env = append(os.Environ(), "AUTOSKILLS_CLI_HELPER=child-write")
+		child.Env = append(os.Environ(), "TEST_CLI_HELPER_BEHAVIOR=child-write")
 		child.Stdout = io.Discard
 		child.Stderr = io.Discard
 		if child.Start() != nil {
 			os.Exit(91)
 		}
+		// announce that the descendant exists, so the test cancels a real process group instead of
+		// racing a helper that was killed before it ever spawned anything
+		_ = os.WriteFile(os.Getenv("TEST_CLI_HELPER_CHILD_MARKER")+".spawned", []byte("spawned"), 0o600)
 		time.Sleep(5 * time.Second)
 	case "child-write":
 		time.Sleep(2 * time.Second)
-		_ = os.WriteFile(os.Getenv("AUTOSKILLS_CHILD_MARKER"), []byte("survived"), 0o600)
+		_ = os.WriteFile(os.Getenv("TEST_CLI_HELPER_CHILD_MARKER"), []byte("survived"), 0o600)
 		os.Exit(0)
 	default:
 		if output := argumentValue(args, "--output-last-message"); output != "" {
@@ -175,6 +195,13 @@ func argumentValue(args []string, name string) string {
 func helperCommand() []string {
 	return []string{os.Args[0], "-test.run=TestCLIHelper", "--"}
 }
+
+// helperTimeout is the deadline for the tests that expect the helper to RUN. Every one of them
+// starts a second copy of this test binary, and under `-race` that copy is instrumented too — a
+// one-second budget turns a functional assertion into a latency measurement, and the test then
+// reports a timeout instead of what it was written to check. The deadline-specific tests below
+// stay deliberately short, because there the deadline *is* the subject.
+const helperTimeout = 60 * time.Second
 
 func newTestCodexProvider(t *testing.T, model string, timeout time.Duration) Provider {
 	t.Helper()
@@ -208,7 +235,7 @@ func decodeInvocation(t *testing.T, output string) helperInvocation {
 }
 
 func TestCodexProviderInvocationIsEphemeralAndNeutral(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	t.Setenv("OPENAI_API_KEY", "must-not-reach-codex")
 	t.Setenv("OpenAI_API_KEY", "must-not-reach-codex")
 	t.Setenv("CODEX_ACCESS_TOKEN", "must-not-reach-codex")
@@ -217,7 +244,7 @@ func TestCodexProviderInvocationIsEphemeralAndNeutral(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-reach-codex")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "must-not-reach-codex")
 	t.Setenv("RUST_LOG", "trace")
-	p := newTestCodexProvider(t, "gpt-test", time.Second)
+	p := newTestCodexProvider(t, "gpt-test", helperTimeout)
 	payload := preparedPayload(t)
 	originalDir, _ := os.Getwd()
 	out, err := p.Generate(context.Background(), payload)
@@ -264,18 +291,55 @@ func TestCodexProviderInvocationIsEphemeralAndNeutral(t *testing.T) {
 	}
 }
 
+// AutoSkills' own configuration is the credential path of the HTTP provider. A CLI child runs on
+// its own subscription authentication and has no use for it — and a subprocess that can read
+// AUTOSKILLS_ENDPOINT or AUTOSKILLS_PROVIDER can also be steered by them. The assertion is exact
+// absence of the whole prefix, not the absence of a list someone remembered to write down.
+func TestCLIProvidersDoNotLeakAutoSkillsEnvironment(t *testing.T) {
+	for name, makeProvider := range map[string]func(*testing.T) Provider{
+		"codex":  func(t *testing.T) Provider { return newTestCodexProvider(t, "", helperTimeout) },
+		"claude": func(*testing.T) Provider { return newClaudeProvider(helperCommand(), "", helperTimeout) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
+			t.Setenv("AUTOSKILLS_API_KEY", "must-not-reach-the-cli")
+			t.Setenv("AUTOSKILLS_PROVIDER", "http")
+			t.Setenv("AUTOSKILLS_ENDPOINT", "https://gateway.attacker.example/v1")
+			t.Setenv("AUTOSKILLS_MODEL", "must-not-reach-the-cli")
+			t.Setenv("AUTOSKILLS_SOMETHING_ADDED_LATER", "must-not-reach-the-cli")
+			t.Setenv("AutoSkills_Api_Key", "must-not-reach-the-cli")
+
+			out, err := makeProvider(t).Generate(context.Background(), preparedPayload(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := decodeInvocation(t, out)
+			if len(got.AutoSkillsNames) != 0 {
+				t.Fatalf("AutoSkills configuration reached the CLI child: %v", got.AutoSkillsNames)
+			}
+			if len(got.EnvironmentLeaks) != 0 {
+				t.Fatalf("provider credentials reached the CLI child: %v", got.EnvironmentLeaks)
+			}
+			// removing everything would satisfy the assertions above and break the provider
+			if !got.PathPresent {
+				t.Fatal("the child lost PATH: the filter removed the environment it needs to run")
+			}
+		})
+	}
+}
+
 func TestCodexProviderRequiresAuthJSON(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	t.Setenv("CODEX_HOME", t.TempDir())
-	_, err := newCodexProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t))
+	_, err := newCodexProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), preparedPayload(t))
 	if !errors.Is(err, ErrNotAuthenticated) || !strings.Contains(err.Error(), "run codex login") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestCodexProviderRejectsSymlinkedFinalOutput(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "symlink-output")
-	_, err := newTestCodexProvider(t, "", time.Second).Generate(context.Background(), preparedPayload(t))
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "symlink-output")
+	_, err := newTestCodexProvider(t, "", helperTimeout).Generate(context.Background(), preparedPayload(t))
 	if !errors.Is(err, ErrInvalidOutput) {
 		t.Fatalf("error = %v", err)
 	}
@@ -330,7 +394,7 @@ func TestCodexAuthenticationRefusesUnprotectedCopy(t *testing.T) {
 }
 
 func TestClaudeProviderInvocationIsSafeAndNonPersistent(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	t.Setenv("ANTHROPIC_API_KEY", "must-not-reach-claude")
 	t.Setenv("Anthropic_API_KEY", "must-not-reach-claude")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-reach-claude")
@@ -339,7 +403,7 @@ func TestClaudeProviderInvocationIsSafeAndNonPersistent(t *testing.T) {
 	t.Setenv("Codex_Home", "must-not-reach-claude")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "must-not-reach-claude")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "must-not-reach-claude")
-	p := newClaudeProvider(helperCommand(), "sonnet", time.Second)
+	p := newClaudeProvider(helperCommand(), "sonnet", helperTimeout)
 	payload := preparedPayload(t)
 	out, err := p.Generate(context.Background(), payload)
 	if err != nil {
@@ -394,31 +458,31 @@ func TestCLIProvidersRejectFailures(t *testing.T) {
 			{behavior: "invalid", want: ErrInvalidOutput},
 		} {
 			t.Run(name+"/"+tc.behavior, func(t *testing.T) {
-				t.Setenv("AUTOSKILLS_CLI_HELPER", tc.behavior)
-				if _, err := makeProvider(time.Second).Generate(context.Background(), preparedPayload(t)); !errors.Is(err, tc.want) {
+				t.Setenv("TEST_CLI_HELPER_BEHAVIOR", tc.behavior)
+				if _, err := makeProvider(helperTimeout).Generate(context.Background(), preparedPayload(t)); !errors.Is(err, tc.want) {
 					t.Fatalf("%s error = %v, want %v", tc.behavior, err, tc.want)
 				}
 			})
 		}
 		t.Run(name+"/caller_timeout", func(t *testing.T) {
-			t.Setenv("AUTOSKILLS_CLI_HELPER", "sleep")
+			t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "sleep")
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 			defer cancel()
-			if _, err := makeProvider(time.Second).Generate(ctx, preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+			if _, err := makeProvider(helperTimeout).Generate(ctx, preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
 				t.Fatalf("timeout error = %v", err)
 			}
 		})
 		t.Run(name+"/provider_timeout", func(t *testing.T) {
-			t.Setenv("AUTOSKILLS_CLI_HELPER", "sleep")
+			t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "sleep")
 			if _, err := makeProvider(20*time.Millisecond).Generate(context.Background(), preparedPayload(t)); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("provider timeout error = %v", err)
 			}
 		})
 		t.Run(name+"/cancel", func(t *testing.T) {
-			t.Setenv("AUTOSKILLS_CLI_HELPER", "sleep")
+			t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "sleep")
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			if _, err := makeProvider(time.Second).Generate(ctx, preparedPayload(t)); !errors.Is(err, context.Canceled) {
+			if _, err := makeProvider(helperTimeout).Generate(ctx, preparedPayload(t)); !errors.Is(err, context.Canceled) {
 				t.Fatalf("cancellation error = %v", err)
 			}
 		})
@@ -427,11 +491,11 @@ func TestCLIProvidersRejectFailures(t *testing.T) {
 
 func TestCLIProvidersBoundOutput(t *testing.T) {
 	for name, provider := range map[string]Provider{
-		"codex":  newTestCodexProvider(t, "", time.Second),
-		"claude": newClaudeProvider(helperCommand(), "", time.Second),
+		"codex":  newTestCodexProvider(t, "", helperTimeout),
+		"claude": newClaudeProvider(helperCommand(), "", helperTimeout),
 	} {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv("AUTOSKILLS_CLI_HELPER", "large")
+			t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "large")
 			if _, err := provider.Generate(context.Background(), preparedPayload(t)); !errors.Is(err, ErrOutputTooLarge) {
 				t.Fatalf("error = %v", err)
 			}
@@ -441,20 +505,42 @@ func TestCLIProvidersBoundOutput(t *testing.T) {
 
 func TestCLIProviderCancellationStopsDescendants(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "child-survived")
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "spawn-child")
-	t.Setenv("AUTOSKILLS_CHILD_MARKER", marker)
-	_, err := newClaudeProvider(helperCommand(), "", 50*time.Millisecond).Generate(context.Background(), preparedPayload(t))
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("timeout error = %v", err)
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "spawn-child")
+	t.Setenv("TEST_CLI_HELPER_CHILD_MARKER", marker)
+
+	// A fixed short deadline made this pass vacuously as soon as the helper got slower — race
+	// instrumentation is enough — because a helper killed before it spawned anything also leaves no
+	// surviving descendant. Cancellation is therefore driven by the descendant's own existence.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		deadline := time.Now().Add(helperTimeout)
+		for time.Now().Before(deadline) && ctx.Err() == nil {
+			if _, err := os.Stat(marker + ".spawned"); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel()
+	}()
+
+	_, err := newClaudeProvider(helperCommand(), "", helperTimeout).Generate(ctx, preparedPayload(t))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error = %v", err)
 	}
-	time.Sleep(2500 * time.Millisecond)
+	if _, statErr := os.Stat(marker + ".spawned"); statErr != nil {
+		t.Fatalf("the descendant never started, so the kill proved nothing: %v", statErr)
+	}
+	// the descendant writes its own marker two seconds after starting; outliving the kill is the
+	// exact failure this test exists for
+	time.Sleep(3 * time.Second)
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("descendant survived cancellation: %v", err)
 	}
 }
 
 func TestCLIProviderRefusesTemporaryDirectoryInsideExcludedRoot(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	excluded := t.TempDir()
 	t.Setenv("TMPDIR", excluded)
 	t.Setenv("TMP", excluded)
@@ -465,13 +551,13 @@ func TestCLIProviderRefusesTemporaryDirectoryInsideExcludedRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newTestCodexProvider(t, "", time.Second).Generate(context.Background(), payload); err == nil || !strings.Contains(err.Error(), "neutral working directory") {
+	if _, err := newTestCodexProvider(t, "", helperTimeout).Generate(context.Background(), payload); err == nil || !strings.Contains(err.Error(), "neutral working directory") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestCLIProviderAcceptsMissingExcludedRoot(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	excluded := filepath.Join(t.TempDir(), "deleted-repository")
 	var builder outbound.Builder
 	builder.Static("user")
@@ -479,7 +565,7 @@ func TestCLIProviderAcceptsMissingExcludedRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), payload)
+	out, err := newClaudeProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +575,7 @@ func TestCLIProviderAcceptsMissingExcludedRoot(t *testing.T) {
 }
 
 func TestCLIProviderResolvesSymlinkedTemporaryRoot(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	excluded := t.TempDir()
 	alias := filepath.Join(t.TempDir(), "alias")
 	if err := os.Symlink(excluded, alias); err != nil {
@@ -504,13 +590,13 @@ func TestCLIProviderResolvesSymlinkedTemporaryRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), payload); err == nil || !strings.Contains(err.Error(), "neutral working directory") {
+	if _, err := newClaudeProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), payload); err == nil || !strings.Contains(err.Error(), "neutral working directory") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestCLIProviderRefusesInstructionBearingTemporaryAncestor(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	base := t.TempDir()
 	if err := os.WriteFile(filepath.Join(base, "AGENTS.md"), []byte("instructions"), 0o600); err != nil {
 		t.Fatal(err)
@@ -522,13 +608,13 @@ func TestCLIProviderRefusesInstructionBearingTemporaryAncestor(t *testing.T) {
 	t.Setenv("TMPDIR", temporaryBase)
 	t.Setenv("TMP", temporaryBase)
 	t.Setenv("TEMP", temporaryBase)
-	if _, err := newTestCodexProvider(t, "", time.Second).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "configuration or instructions") {
+	if _, err := newTestCodexProvider(t, "", helperTimeout).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "configuration or instructions") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestCLIProviderRefusesConfigurationBearingTemporaryAncestor(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	base := t.TempDir()
 	if err := os.Mkdir(filepath.Join(base, ".codex"), 0o700); err != nil {
 		t.Fatal(err)
@@ -540,13 +626,13 @@ func TestCLIProviderRefusesConfigurationBearingTemporaryAncestor(t *testing.T) {
 	t.Setenv("TMPDIR", temporaryBase)
 	t.Setenv("TMP", temporaryBase)
 	t.Setenv("TEMP", temporaryBase)
-	if _, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "configuration or instructions") {
+	if _, err := newClaudeProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "configuration or instructions") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestCLIProviderAllowsUserConfigurationBoundary(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	home := filepath.Join(t.TempDir(), "home")
 	temporaryBase := filepath.Join(home, "tmp")
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
@@ -563,7 +649,7 @@ func TestCLIProviderAllowsUserConfigurationBoundary(t *testing.T) {
 	t.Setenv("TMPDIR", temporaryBase)
 	t.Setenv("TMP", temporaryBase)
 	t.Setenv("TEMP", temporaryBase)
-	out, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t))
+	out, err := newClaudeProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), preparedPayload(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -590,7 +676,7 @@ func TestPathWithinUsesPathComponents(t *testing.T) {
 }
 
 func TestCLIProviderRefusesTemporaryDirectoryInsideCallerTree(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	dir, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -598,15 +684,15 @@ func TestCLIProviderRefusesTemporaryDirectoryInsideCallerTree(t *testing.T) {
 	t.Setenv("TMPDIR", dir)
 	t.Setenv("TMP", dir)
 	t.Setenv("TEMP", dir)
-	if _, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "neutral working directory") {
+	if _, err := newClaudeProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "neutral working directory") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestCLIProviderWorksFromFilesystemRoot(t *testing.T) {
-	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "success")
 	t.Chdir(filepath.VolumeName(string(filepath.Separator)) + string(filepath.Separator))
-	out, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t))
+	out, err := newClaudeProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), preparedPayload(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,11 +709,11 @@ func TestCLIErrorKeepsCauseWithoutEchoingPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, provider := range map[string]Provider{
-		"codex":  newTestCodexProvider(t, "", time.Second),
-		"claude": newClaudeProvider(helperCommand(), "", time.Second),
+		"codex":  newTestCodexProvider(t, "", helperTimeout),
+		"claude": newClaudeProvider(helperCommand(), "", helperTimeout),
 	} {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv("AUTOSKILLS_CLI_HELPER", "request-error")
+			t.Setenv("TEST_CLI_HELPER_BEHAVIOR", "request-error")
 			_, err := provider.Generate(context.Background(), payload)
 			if err == nil || !strings.Contains(err.Error(), "schema rejected") {
 				t.Fatalf("error = %v", err)
@@ -653,14 +739,14 @@ func TestCLIAuthenticationClassificationDoesNotEchoPrompt(t *testing.T) {
 		{behavior: "claude-prompt-auth-json", prompt: "authentication required in private prompt", wantAuth: false},
 	} {
 		t.Run(tc.behavior, func(t *testing.T) {
-			t.Setenv("AUTOSKILLS_CLI_HELPER", tc.behavior)
+			t.Setenv("TEST_CLI_HELPER_BEHAVIOR", tc.behavior)
 			var builder outbound.Builder
 			builder.Data(tc.prompt, 0)
 			payload, err := builder.BuildWithOutputSchema("system", testOutputSchema)
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), payload)
+			_, err = newClaudeProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), payload)
 			if err == nil {
 				t.Fatal("expected provider error")
 			}
@@ -688,14 +774,14 @@ func TestCLIErrorDoesNotEchoPromptFragments(t *testing.T) {
 		{behavior: "prompt-partial-token-error", system: "privatecustomerprojectcodename", user: "user", leak: "customerproject"},
 	} {
 		t.Run(tc.behavior, func(t *testing.T) {
-			t.Setenv("AUTOSKILLS_CLI_HELPER", tc.behavior)
+			t.Setenv("TEST_CLI_HELPER_BEHAVIOR", tc.behavior)
 			var builder outbound.Builder
 			builder.Data(tc.user, 0)
 			payload, err := builder.BuildWithOutputSchema(tc.system, testOutputSchema)
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), payload)
+			_, err = newClaudeProvider(helperCommand(), "", helperTimeout).Generate(context.Background(), payload)
 			if err == nil || !strings.Contains(err.Error(), "exited non-zero") {
 				t.Fatalf("error = %v", err)
 			}

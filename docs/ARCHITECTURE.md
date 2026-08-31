@@ -1,6 +1,6 @@
 # Architecture d’AutoSkills
 
-État observé le 30 août 2026 sur le commit `9c3949ddc055841af538b834db8d2861410b5fdd`.
+État observé le 31 août 2026 sur la branche de préparation de la PR #1. Les preuves de merge restent attachées au SHA final de la PR, pas à ce document.
 
 ## Résumé
 
@@ -36,8 +36,8 @@ Claude JSONL ─┘                                      │
 | `internal/llm` | Interface d’inférence et providers HTTP chat-completions, Codex CLI, Claude Code CLI | Les CLIs conservent leur comportement système/auth interne; le provider HTTP mélange les en-têtes compatibles. |
 | `internal/store` | SQLite local pour checkpoints, suggestions, journal d’acceptation et réservation de ressources | Depuis HOK-540: schéma versionné par `user_version` **et vérifié en forme** à l’ouverture (tables et colonnes obligatoires), migrations transactionnelles avec sauvegarde, refus explicite d’une base corrompue ou incomplète, checkpoint et suggestions dans une seule transaction, décisions en compare-and-set, claims durables par fichier et état d’abandon `rolling_back` explicite. Reste mono-processus et sans réplication. |
 | `internal/writer` | Placement et mise à jour des artefacts runtime | Depuis HOK-540: mutation multi-fichiers planifiée en entier, journalisée, atomique par fichier, réversible et réconciliée au démarrage; toute opération filesystem passe par un `os.Root` sur une racine autorisée dont l’identité est capturée puis reprouvée à chaque reprise; checksums et permissions capturés sont des préconditions, revérifiées juste avant chaque remplacement puis sur le manifeste entier avant la décision. Les destinations restent surtout Cursor tant que le registry HOK-544 n’existe pas. |
-| `internal/server` | API locale et UI embarquée | Loopback par défaut, mais exposition possible sans barrière Origin/token/limites. |
-| `web` | Inbox de review React/Vite | Build séparé; aucune suite de tests UI; pnpm n’est pas reproductible sur l’hôte actuel. |
+| `internal/server` | API locale et UI embarquée | Loopback par défaut; les routes API vérifient Host/Origin et les mutations exigent une capacité éphémère, un JSON strict et un corps borné. Une adresse d’écoute non-loopback reste un choix explicite de l’opérateur. |
+| `web` | Inbox de review React/Vite | Build séparé avec Bun 1.4.0; aucune suite de tests UI dédiée. |
 
 ## Problèmes structurants
 
@@ -167,7 +167,7 @@ CandidateOperation
 - `go vet ./...` et `go build ./...` passent sous Windows.
 - l’assertion de bit exécutable non portable d’`internal/writer` a disparu avec la génération de `run.sh` (HOK-539); la preuve d’exécution de `go test ./...` appartient à la revue de cette tranche, pas à ce document.
 - Lint TypeScript et vérification des types passent lorsqu’ils sont lancés directement.
-- Le workflow pnpm échoue sur la policy de builds de dépendances; la migration vers Bun natif 1.4.0 est suivie par HOK-538.
+- Le frontend utilise Bun 1.4.0 avec lockfile gelé; la CI vérifie la version réelle de Bun, le lint, le build et l’état exact de `web/dist`.
 - La CI amont prouve uniquement Ubuntu au même SHA, sans release ni artefact.
 
 Ces éléments constituent une baseline. Ils ne prouvent ni la sécurité, ni la portabilité, ni la maturité du produit.

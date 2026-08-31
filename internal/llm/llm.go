@@ -77,6 +77,15 @@ func ValidateEndpoint(raw string) error {
 	if u.Fragment != "" {
 		return fmt.Errorf("llm: endpoint must not carry a fragment")
 	}
+	// A base endpoint is a prefix that "/chat/completions" is appended to. With a query already
+	// present that concatenation produces "…?key=secret/chat/completions": the path lands inside a
+	// query parameter, the request goes somewhere nobody configured, and a credential smuggled in
+	// the query travels with it. There is no correct way to append a path after a query, so the
+	// ambiguity is refused instead of resolved. An explicit api_key remains the only credential
+	// path for a custom gateway.
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("llm: endpoint must not carry a query string — configure credentials with api_key, not in the URL")
+	}
 	host := u.Hostname()
 	if host == "" {
 		return fmt.Errorf("llm: endpoint has no host")

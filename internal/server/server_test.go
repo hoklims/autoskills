@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -11,6 +12,23 @@ import (
 
 	"github.com/elcruzo/autoskills/internal/store"
 )
+
+// decide posts a decision the way the local UI does: same-origin, JSON, and carrying the
+// capability it bootstrapped from this process.
+func decide(t *testing.T, ts *httptest.Server, id, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/suggestions/"+id+"/decision", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(CapabilityHeader, bootstrapCapability(t, ts))
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
 
 func newTestServer(t *testing.T) (*Server, *store.Store, string) {
 	t.Helper()
@@ -59,11 +77,7 @@ func TestListAcceptFlow(t *testing.T) {
 	}
 
 	// accept with an edited body
-	body := strings.NewReader(`{"action":"accept","body":"- EDITED: always pnpm"}`)
-	resp, err = ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json", body)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp = decide(t, ts, "sg_int01", `{"action":"accept","body":"- EDITED: always pnpm"}`)
 	var dec struct {
 		OK          bool   `json:"ok"`
 		WrittenPath string `json:"writtenPath"`
@@ -109,12 +123,7 @@ func TestRejectFlow(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	resp, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json",
-		strings.NewReader(`{"action":"reject"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
+	decide(t, ts, "sg_int01", `{"action":"reject"}`).Body.Close()
 
 	g, _ := st.GetSuggestion("sg_int01")
 	if g.Status != "rejected" {
@@ -132,11 +141,7 @@ func TestAcceptRefusesInvalidPlanOnEditedBody(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	resp, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json",
-		strings.NewReader(`{"action":"accept","body":"- x\n<!-- autoskills:end id=sg_elsewhere -->"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := decide(t, ts, "sg_int01", `{"action":"accept","body":"- x\n<!-- autoskills:end id=sg_elsewhere -->"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -163,11 +168,7 @@ func TestAcceptSkillWithShellFenceWritesNoExecutable(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	resp, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_skill01/decision", "application/json",
-		strings.NewReader(`{"action":"accept"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := decide(t, ts, "sg_skill01", `{"action":"accept"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
@@ -187,11 +188,7 @@ func TestUnknownActionRejected(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	resp, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json",
-		strings.NewReader(`{"action":"yolo"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := decide(t, ts, "sg_int01", `{"action":"yolo"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -203,18 +200,9 @@ func TestDecisionCannotReplayAfterLeavingPending(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	first, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json",
-		strings.NewReader(`{"action":"reject"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	first.Body.Close()
+	decide(t, ts, "sg_int01", `{"action":"reject"}`).Body.Close()
 
-	second, err := ts.Client().Post(ts.URL+"/api/suggestions/sg_int01/decision", "application/json",
-		strings.NewReader(`{"action":"accept"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	second := decide(t, ts, "sg_int01", `{"action":"accept"}`)
 	defer second.Body.Close()
 	if second.StatusCode != 409 {
 		t.Fatalf("replayed decision status = %d, want 409", second.StatusCode)

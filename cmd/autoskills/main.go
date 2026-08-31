@@ -876,7 +876,9 @@ func cmdReview(args []string) error {
 	}
 	defer st.Close()
 
-	srv := &server.Server{Store: st}
+	// the listen address is passed in, not assumed: it decides which Host a browser may present,
+	// and a wildcard address grants no name beyond loopback
+	srv := &server.Server{Store: st, Addr: *addr}
 	url := "http://" + *addr
 	fmt.Printf("autoskills review — %s (ctrl-c to stop)\n", url)
 	if !*noOpen {

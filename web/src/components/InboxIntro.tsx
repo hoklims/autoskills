@@ -10,7 +10,7 @@ export function InboxIntro() {
       <ol className="inbox-intro__steps">
         <li className="inbox-intro__step">
           <span className="inbox-intro__step-name">evidence</span>
-          <span className="inbox-intro__step-desc">real excerpts from your sessions that triggered this proposal</span>
+          <span className="inbox-intro__step-desc">source excerpts when this proposal came from a session</span>
         </li>
         <li className="inbox-intro__step">
           <span className="inbox-intro__step-name">edit</span>

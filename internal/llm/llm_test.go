@@ -39,11 +39,54 @@ func TestValidateEndpointPolicy(t *testing.T) {
 		"://nonsense",
 		"",
 		"https://api.example.com/v1#fragment",
+		"https://gateway.example.com/v1?key=secret",   // appending a path would land inside the query
+		"https://gateway.example.com/v1?",             // empty query marker is still a query
+		"http://localhost:11434/v1?api-version=2024",  // loopback does not make it unambiguous
+		"https://gateway.example.com/v1?a=1&b=2#frag", // query and fragment together
 	}
 	for _, e := range bad {
 		if err := ValidateEndpoint(e); err == nil {
 			t.Errorf("endpoint %q must be rejected", e)
 		}
+	}
+}
+
+// The refusal has to happen before a client exists, not at request time: the point is that no
+// request carrying the key is ever built against an ambiguous destination.
+func TestNewRejectsEndpointCarryingQuery(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://gateway.example.com/v1?key=sk-secret",
+		"https://gateway.example.com/v1?",
+	} {
+		c, err := New(endpoint, "sk-secret", "m")
+		if err == nil {
+			t.Fatalf("endpoint %q accepted: %+v", endpoint, c)
+		}
+		if strings.Contains(err.Error(), "sk-secret") {
+			t.Fatalf("error echoed the URL credential: %v", err)
+		}
+	}
+	// a clean custom gateway path still works — the rule is about ambiguity, not about custom hosts
+	if _, err := New("https://gateway.corp.example.com:8443/openai/v1", "sk-secret", "m"); err != nil {
+		t.Fatalf("clean custom gateway refused: %v", err)
+	}
+}
+
+// A Client built as a struct literal must not be able to put the key on the wire toward an
+// ambiguous destination either: the same gate is re-checked before the request is composed.
+func TestGenerateRejectsEndpointCarryingQuery(t *testing.T) {
+	var reached bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		reached = true
+	}))
+	defer upstream.Close()
+
+	c := &Client{Endpoint: upstream.URL + "/v1?key=secret", APIKey: "sk-secret", Model: "m", HTTP: upstream.Client()}
+	if _, err := c.Generate(context.Background(), preparedPayload(t)); err == nil {
+		t.Fatal("Generate accepted an endpoint carrying a query")
+	}
+	if reached {
+		t.Fatal("a request was sent to an endpoint that never passed the policy")
 	}
 }
 
