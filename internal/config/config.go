@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,6 +63,59 @@ func defaults() Config {
 	}
 }
 
+func parseProvider(value string) (string, error) {
+	provider := strings.ToLower(strings.TrimSpace(value))
+	switch provider {
+	case "http", "codex", "claude":
+		return provider, nil
+	default:
+		return "", fmt.Errorf("invalid LLM provider %q: expected http, codex, or claude", value)
+	}
+}
+
+func providerField(raw []byte) (json.RawMessage, bool, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, false, err
+	}
+	object, ok := token.(json.Delim)
+	if !ok || object != '{' {
+		return nil, false, errors.New("configuration must be a JSON object")
+	}
+	var provider json.RawMessage
+	found := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false, errors.New("configuration field name must be a string")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false, err
+		}
+		if !strings.EqualFold(key, "provider") {
+			continue
+		}
+		if key != "provider" {
+			return nil, false, fmt.Errorf("invalid provider field %q: expected provider", key)
+		}
+		if found {
+			return nil, false, errors.New("duplicate provider field")
+		}
+		provider = value
+		found = true
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, false, err
+	}
+	return provider, found, nil
+}
+
 // Load reads the config file if present, then applies env overrides:
 // AUTOSKILLS_PROVIDER, AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL.
 // Falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY when no key is configured
@@ -75,9 +129,26 @@ func Load() (Config, error) {
 		if jerr := json.Unmarshal(raw, &cfg); jerr != nil {
 			return cfg, fmt.Errorf("parse %s: %w", Path(), jerr)
 		}
+		rawProvider, providerPresent, jerr := providerField(raw)
+		if jerr != nil {
+			return cfg, fmt.Errorf("parse %s: %w", Path(), jerr)
+		}
 		var fields map[string]json.RawMessage
 		if jerr := json.Unmarshal(raw, &fields); jerr == nil {
 			_, modelConfigured = fields["model"]
+			if providerPresent {
+				var provider *string
+				if jerr := json.Unmarshal(rawProvider, &provider); jerr != nil {
+					return cfg, fmt.Errorf("parse provider in %s: %w", Path(), jerr)
+				}
+				if provider == nil {
+					return cfg, fmt.Errorf("invalid LLM provider null: expected http, codex, or claude")
+				}
+				cfg.Provider, jerr = parseProvider(*provider)
+				if jerr != nil {
+					return cfg, jerr
+				}
+			}
 		}
 	case errors.Is(err, os.ErrNotExist):
 		// fine — defaults + env
@@ -85,15 +156,11 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 
-	if v := os.Getenv("AUTOSKILLS_PROVIDER"); v != "" {
-		cfg.Provider = v
-	}
-	cfg.Provider = strings.ToLower(strings.TrimSpace(cfg.Provider))
-	if cfg.Provider == "" {
-		cfg.Provider = "http"
-	}
-	if cfg.Provider != "http" && cfg.Provider != "codex" && cfg.Provider != "claude" {
-		return cfg, fmt.Errorf("unknown LLM provider %q: expected http, codex, or claude", cfg.Provider)
+	if value, present := os.LookupEnv("AUTOSKILLS_PROVIDER"); present {
+		cfg.Provider, err = parseProvider(value)
+		if err != nil {
+			return cfg, err
+		}
 	}
 	if cfg.Provider != "http" && !modelConfigured && os.Getenv("AUTOSKILLS_MODEL") == "" {
 		cfg.Model = ""
