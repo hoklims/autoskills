@@ -436,6 +436,24 @@ func TestCLIProviderRefusesTemporaryDirectoryInsideExcludedRoot(t *testing.T) {
 	}
 }
 
+func TestCLIProviderAcceptsMissingExcludedRoot(t *testing.T) {
+	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	excluded := filepath.Join(t.TempDir(), "deleted-repository")
+	var builder outbound.Builder
+	builder.Static("user")
+	payload, err := builder.BuildWithOutputSchema("system", testOutputSchema, excluded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeInvocation(t, out).Dir; pathWithin(excluded, got) {
+		t.Fatalf("working directory %q is inside missing excluded root %q", got, excluded)
+	}
+}
+
 func TestCLIProviderResolvesSymlinkedTemporaryRoot(t *testing.T) {
 	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
 	excluded := t.TempDir()

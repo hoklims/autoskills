@@ -382,6 +382,13 @@ func neutralWorkingDirectory(excludedRoots []string) (string, error) {
 	for _, root := range roots {
 		resolvedRoot, resolveErr := filepath.EvalSymlinks(root)
 		if resolveErr != nil {
+			if errors.Is(resolveErr, os.ErrNotExist) {
+				if pathWithin(root, dir) {
+					_ = os.RemoveAll(dir)
+					return "", fmt.Errorf("llm: neutral working directory must be outside excluded roots")
+				}
+				continue
+			}
 			_ = os.RemoveAll(dir)
 			return "", fmt.Errorf("llm: resolve excluded root: %w", resolveErr)
 		}
