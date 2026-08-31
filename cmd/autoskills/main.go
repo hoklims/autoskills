@@ -95,11 +95,33 @@ scan flags:
   --max N          max sessions to distill this run (default 20)
   --dry-run        parse and report; no LLM calls, nothing stored
 
-config: ~/.autoskills/config.json  (endpoint, api_key, model, trigger_phrase,
-        auto_accept_threshold, section_budget_bytes, daemon_interval_minutes, …)
-env:    AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL
+config: ~/.autoskills/config.json  (provider, endpoint, api_key, model, trigger_phrase,
+        section_budget_bytes, daemon_interval_minutes, …)
+        provider: http (default/legacy), codex, or claude
+        endpoint must be https, or http on loopback for a local model
+        auto_accept_threshold is DEPRECATED and ignored: nothing is written without review
+env:    AUTOSKILLS_PROVIDER, AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL
         (falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY)
 `)
+}
+
+// openStore opens the database and finishes or restores any operation a crash interrupted, before
+// the caller can read the store as if it were authoritative. Every command that may mutate goes
+// through here; `status` deliberately reports instead of acting.
+func openStore() (*store.Store, error) {
+	st, err := store.Open(store.DefaultPath())
+	if err != nil {
+		return nil, err
+	}
+	report, err := writer.Reconcile(st)
+	for _, line := range report {
+		fmt.Fprintln(os.Stderr, "reconciled:", line)
+	}
+	if err != nil {
+		st.Close()
+		return nil, fmt.Errorf("reconcile interrupted operations: %w", err)
+	}
+	return st, nil
 }
 
 func adapters() ([]collector.Adapter, map[string]string) {
@@ -108,6 +130,19 @@ func adapters() ([]collector.Adapter, map[string]string) {
 		"claude": collector.HomePath(".claude", "projects"),
 	}
 	return []collector.Adapter{cursor.New(roots["cursor"]), claude.New(roots["claude"])}, roots
+}
+
+func configuredProvider(cfg config.Config) (llm.Provider, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
+	case "", "http":
+		return llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model)
+	case "codex":
+		return llm.NewCodex(cfg.Model)
+	case "claude":
+		return llm.NewClaude(cfg.Model)
+	default:
+		return nil, fmt.Errorf("unknown LLM provider %q: expected http, codex, or claude", cfg.Provider)
+	}
 }
 
 func cmdScan(args []string) error {
@@ -124,7 +159,7 @@ func cmdScan(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(store.DefaultPath())
+	st, err := openStore()
 	if err != nil {
 		return err
 	}
@@ -157,8 +192,13 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 		}
 	}
 
-	if !opts.dryRun && cfg.APIKey == "" {
-		return fmt.Errorf("no API key: set AUTOSKILLS_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY), or add api_key to %s", config.Path())
+	// Automatic acceptance was removed (HOK-539): a model-authored file write with no human in the
+	// loop is not a tuning dial. A configured threshold is honoured as "still parses", never as
+	// "still writes" — and the operator is told so on every scan rather than silently ignored.
+	if cfg.AutoAcceptThreshold > 0 {
+		fmt.Fprintf(os.Stderr,
+			"warning: auto_accept_threshold=%.2f in %s is IGNORED — automatic acceptance was removed; every suggestion stays pending until you accept it in `autoskills review`\n",
+			cfg.AutoAcceptThreshold, config.Path())
 	}
 
 	// Bounded, run-scoped caches (memory stays flat for the always-on daemon):
@@ -170,8 +210,13 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 
 	var d *distill.Distiller
 	if !opts.dryRun {
+		// endpoint policy is enforced before a client exists: no key travels to an unvetted host
+		provider, err := configuredProvider(cfg)
+		if err != nil {
+			return err
+		}
 		d = &distill.Distiller{
-			Client:        llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model),
+			Provider:      provider,
 			Store:         st,
 			MinConfidence: cfg.MinConfidence,
 			SeenContent:   seenContent,
@@ -265,8 +310,8 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 			}
 			consecutiveFailures = 0
 			distilled++
-			_ = st.SetBytesProcessed(f, info.Size())
 
+			var keep []store.Suggestion
 			for _, g := range suggestions {
 				exists, err := st.TitleExists(g.RepoRoot, g.Title)
 				if err != nil {
@@ -282,28 +327,18 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 					continue
 				}
 				fingerprints.Add(fp, true)
-				// auto-accept tier: high-confidence, non-sensitive suggestions skip the inbox.
-				// Sensitive ones always require human eyes regardless of confidence.
-				if cfg.AutoAcceptThreshold > 0 && g.Confidence >= cfg.AutoAcceptThreshold && !g.Sensitivity {
-					if err := st.InsertSuggestion(g); err != nil {
-						return err
-					}
-					written, werr := writer.Write(g)
-					if werr != nil {
-						fmt.Fprintf(os.Stderr, "    auto-accept write failed for %q: %v (left pending)\n", g.Title, werr)
-						stored++
-						continue
-					}
-					if err := st.Decide(g.ID, "accepted", "", written); err != nil {
-						return err
-					}
-					fmt.Printf("    ✓ auto-accepted %s → %s (undo: autoskills undo %s)\n", g.Title, written, g.ID)
-					continue
-				}
-				if err := st.InsertSuggestion(g); err != nil {
-					return err
-				}
-				stored++
+				// Every suggestion lands pending. Scanning proposes; only a human accepting in
+				// `autoskills review` writes a file.
+				keep = append(keep, g)
+			}
+			// The high-water mark is the claim "everything up to here is stored". It advances in
+			// the same transaction as the suggestions it covers, so a failed insert cannot leave
+			// this file's findings unrecoverable behind an advanced mark.
+			if err := st.AdvanceCheckpoint(f, info.Size(), keep); err != nil {
+				return err
+			}
+			stored += len(keep)
+			for _, g := range keep {
 				fmt.Printf("    + %s (%s, %.0f%%)\n", g.Title, g.Signal, g.Confidence*100)
 			}
 		}
@@ -340,7 +375,7 @@ func cmdDaemon(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(store.DefaultPath())
+	st, err := openStore()
 	if err != nil {
 		return err
 	}
@@ -623,10 +658,7 @@ func cmdGarden(args []string) error {
 	if err != nil {
 		return err
 	}
-	if cfg.APIKey == "" {
-		return fmt.Errorf("no API key configured")
-	}
-	st, err := store.Open(store.DefaultPath())
+	st, err := openStore()
 	if err != nil {
 		return err
 	}
@@ -636,7 +668,11 @@ func cmdGarden(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	d := &distill.Distiller{Client: llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model), Store: st, MinConfidence: cfg.MinConfidence}
+	provider, err := configuredProvider(cfg)
+	if err != nil {
+		return err
+	}
+	d := &distill.Distiller{Provider: provider, Store: st, MinConfidence: cfg.MinConfidence}
 	suggestions, err := d.Garden(ctx, repoRoot, filepath.Base(repoRoot))
 	if err != nil {
 		return err
@@ -752,7 +788,7 @@ func cmdUndo(args []string) error {
 		return err
 	}
 	writer.SectionBudgetBytes = cfg.SectionBudgetBytes
-	st, err := store.Open(store.DefaultPath())
+	st, err := openStore()
 	if err != nil {
 		return err
 	}
@@ -765,17 +801,23 @@ func cmdUndo(args []string) error {
 	if g.Status != "accepted" {
 		return fmt.Errorf("suggestion %s is %s, not accepted", id, g.Status)
 	}
-	// gardener actions rewrite/remove existing blocks in place — the prior content is gone, so
-	// "undo" cannot restore it and pretending otherwise would be destructive. Honest refusal
-	// until accept-time snapshots land (roadmap v0.6).
+	// A gardener action rewrites existing block content in place. Undoing it is a restoration, not
+	// a deletion — so it is available exactly when the acceptance recorded what it overwrote. A
+	// journaled acceptance carries that manifest and can be put back byte for byte; one accepted
+	// before the journal existed carries nothing, and recomputing a removal there would delete a
+	// block instead of restoring the one it replaced. That case is refused by name.
 	if g.Tool == "gardener" {
-		return fmt.Errorf("cannot undo gardener action %s: the original block content was replaced at accept time and is not recoverable; restore it from git history of %s", id, g.WrittenPath)
+		journaled, err := writer.HasJournaledAcceptance(st, g.ID)
+		if err != nil {
+			return err
+		}
+		if !journaled {
+			return fmt.Errorf("cannot undo gardener action %s: it was accepted before the acceptance journal existed, so the block content it replaced was never recorded and cannot be restored; recover it from the git history of %s", id, g.WrittenPath)
+		}
 	}
-	if err := writer.Remove(g); err != nil {
+	// journaled like an accept: the artifact removal and the return to pending cannot come apart
+	if err := writer.Undo(st, g); err != nil {
 		return fmt.Errorf("remove artifact: %w", err)
-	}
-	if err := st.Decide(id, "pending", "", ""); err != nil {
-		return err
 	}
 	fmt.Printf("undone: %s — artifact removed, suggestion back in the inbox\n", g.Title)
 	return nil
@@ -828,13 +870,15 @@ func cmdReview(args []string) error {
 	}
 	writer.SectionBudgetBytes = cfg.SectionBudgetBytes // dashboard accepts respect the configured budget
 
-	st, err := store.Open(store.DefaultPath())
+	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	srv := &server.Server{Store: st}
+	// the listen address is passed in, not assumed: it decides which Host a browser may present,
+	// and a wildcard address grants no name beyond loopback
+	srv := &server.Server{Store: st, Addr: *addr}
 	url := "http://" + *addr
 	fmt.Printf("autoskills review — %s (ctrl-c to stop)\n", url)
 	if !*noOpen {
@@ -874,5 +918,13 @@ func cmdStatus(args []string) error {
 	}
 	fmt.Printf("\nsuggestions: %d pending · %d accepted · %d rejected (%d sessions, %d projects)\n",
 		stats.Pending, stats.Accepted, stats.Rejected, stats.Sessions, stats.Projects)
+	// status reports, it never mutates: interrupted operations are named here and reconciled by
+	// the next command that actually opens the store for work.
+	if open, err := st.IncompleteOperations(); err == nil && len(open) > 0 {
+		fmt.Printf("\n%d interrupted operation(s) pending reconciliation — the next scan, review or undo completes or restores them:\n", len(open))
+		for _, op := range open {
+			fmt.Printf("  %s  %s %s (%s)\n", op.ID, op.Kind, op.SuggestionID, op.State)
+		}
+	}
 	return nil
 }

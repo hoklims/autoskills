@@ -29,7 +29,7 @@ export function SuggestionCard({ suggestion, leaving, readonly = false, onDecisi
         <span className="suggestion-card__project">{suggestion.project}</span>
       </div>
 
-      <h3 className="suggestion-card__title">{suggestion.title}</h3>
+      <h2 className="suggestion-card__title">{suggestion.title}</h2>
       <p className="suggestion-card__rationale">{suggestion.rationale}</p>
 
       {suggestion.evidence.length > 0 && (
@@ -79,14 +79,14 @@ export function SuggestionCard({ suggestion, leaving, readonly = false, onDecisi
               disabled={leaving}
               onClick={() => onDecision('reject')}
             >
-              reject
+              reject suggestion
             </button>
             <button
               type="button"
               className="btn-secondary suggestion-card__btn"
               onClick={() => setEditing((v) => !v)}
             >
-              {editing ? 'done' : 'edit'}
+              {editing ? 'finish editing' : 'edit draft'}
             </button>
             <button
               type="button"
@@ -94,7 +94,7 @@ export function SuggestionCard({ suggestion, leaving, readonly = false, onDecisi
               disabled={leaving}
               onClick={() => onDecision('accept', editedBody)}
             >
-              accept
+              accept &amp; write
             </button>
           </div>
         )}

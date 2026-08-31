@@ -10,12 +10,12 @@ web/tsconfig.tsbuildinfo
 # (web/dist is intentionally NOT ignored)
 
 # private — kept local-only, never pushed to the open-source repo
-docs/
 PRD.md
 DESIGN.md
 AGENTS.md
 
 # local
+graphify-out/
 .DS_Store
 *.log
 .env

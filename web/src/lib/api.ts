@@ -48,12 +48,30 @@ export interface DecisionResponse {
   writtenPath?: string
 }
 
+const CAPABILITY_HEADER = 'X-AutoSkills-Capability'
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, init)
   if (!res.ok) {
     throw new Error(`${init?.method ?? 'GET'} ${path} failed: ${res.status}`)
   }
   return res.json() as Promise<T>
+}
+
+// The capability authorizes a decision. It belongs to the running autoskills process, so it is
+// fetched from it and kept in memory only — persisting it would outlive the process that issued it.
+let capability: Promise<string> | null = null
+
+function getCapability(): Promise<string> {
+  if (!capability) {
+    capability = request<{ capability: string }>('/api/capability')
+      .then(({ capability: token }) => token)
+      .catch((err: unknown) => {
+        capability = null // a failed bootstrap must not poison every later decision
+        throw err
+      })
+  }
+  return capability
 }
 
 export function getStats(): Promise<Stats> {
@@ -68,10 +86,15 @@ export function getProjects(): Promise<{ projects: Project[] }> {
   return request<{ projects: Project[] }>('/api/projects')
 }
 
-export function postDecision(id: string, action: DecisionAction, body?: string): Promise<DecisionResponse> {
+export async function postDecision(
+  id: string,
+  action: DecisionAction,
+  body?: string,
+): Promise<DecisionResponse> {
+  const token = await getCapability()
   return request<DecisionResponse>(`/api/suggestions/${id}/decision`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', [CAPABILITY_HEADER]: token },
     body: JSON.stringify(body !== undefined ? { action, body } : { action }),
   })
 }
