@@ -17,6 +17,17 @@ jobs:
         with:
           bun-version: "1.4.0"
 
+      - name: Verify Bun pin parity
+        working-directory: web
+        shell: bash
+        run: |
+          expected="bun@$(bun --version)"
+          actual="$(bun -p 'require("./package.json").packageManager')"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "packageManager is $actual but CI installed $expected" >&2
+            exit 1
+          fi
+
       - name: Install dashboard dependencies
         working-directory: web
         run: bun install --frozen-lockfile
@@ -30,7 +41,14 @@ jobs:
         run: bun run build
 
       - name: Verify generated dashboard is current
-        run: git diff --exit-code -- web/dist
+        shell: bash
+        run: |
+          status="$(git status --porcelain=v1 --untracked-files=all -- web/dist)"
+          if [[ -n "$status" ]]; then
+            printf '%s\n' "$status" >&2
+            echo 'web/dist is not the exact output of the dashboard build' >&2
+            exit 1
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@v5
