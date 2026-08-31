@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +71,21 @@ func parseProvider(value string) (string, error) {
 		return provider, nil
 	default:
 		return "", fmt.Errorf("invalid LLM provider %q: expected http, codex, or claude", value)
+	}
+}
+
+func officialHTTPProvider(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" {
+		return ""
+	}
+	switch strings.ToLower(parsed.Hostname()) {
+	case "api.anthropic.com":
+		return "anthropic"
+	case "api.openai.com":
+		return "openai"
+	default:
+		return ""
 	}
 }
 
@@ -156,10 +172,15 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 
+	fileProvider := cfg.Provider
 	if value, present := os.LookupEnv("AUTOSKILLS_PROVIDER"); present {
 		cfg.Provider, err = parseProvider(value)
 		if err != nil {
 			return cfg, err
+		}
+		if cfg.Provider != fileProvider && os.Getenv("AUTOSKILLS_MODEL") == "" {
+			cfg.Model = ""
+			modelConfigured = false
 		}
 	}
 	if cfg.Provider != "http" && !modelConfigured && os.Getenv("AUTOSKILLS_MODEL") == "" {
@@ -175,12 +196,17 @@ func Load() (Config, error) {
 		cfg.APIKey = v
 	}
 	if cfg.Provider == "http" && cfg.APIKey == "" {
-		// match the provider key to the endpoint; never send one provider's key to another
-		anthropicEndpoint := strings.Contains(cfg.Endpoint, "anthropic")
-		if v := os.Getenv("ANTHROPIC_API_KEY"); v != "" && anthropicEndpoint {
-			cfg.APIKey = v
-		} else if v := os.Getenv("OPENAI_API_KEY"); v != "" && !anthropicEndpoint {
-			cfg.APIKey = v
+		// Only official HTTPS endpoints may inherit provider credentials. Custom gateways
+		// must use api_key or AUTOSKILLS_API_KEY explicitly.
+		switch officialHTTPProvider(cfg.Endpoint) {
+		case "anthropic":
+			if v := os.Getenv("ANTHROPIC_API_KEY"); v != "" {
+				cfg.APIKey = v
+			}
+		case "openai":
+			if v := os.Getenv("OPENAI_API_KEY"); v != "" {
+				cfg.APIKey = v
+			}
 		}
 	}
 	if cfg.MaxSuggestionsPerScan <= 0 {

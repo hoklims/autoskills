@@ -124,3 +124,73 @@ func TestLoadRejectsInvalidProviderEnvironment(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadOnlyInheritsCredentialsForOfficialHTTPSHosts(t *testing.T) {
+	unsetEnv(t, "AUTOSKILLS_PROVIDER")
+	unsetEnv(t, "AUTOSKILLS_API_KEY")
+	t.Setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+	t.Setenv("OPENAI_API_KEY", "openai-secret")
+
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{name: "anthropic official", endpoint: "https://api.anthropic.com/v1", want: "anthropic-secret"},
+		{name: "openai official", endpoint: "https://api.openai.com/v1", want: "openai-secret"},
+		{name: "custom gateway", endpoint: "https://gateway.company.test/v1"},
+		{name: "anthropic lookalike", endpoint: "https://api.anthropic.com.evil/v1"},
+		{name: "openai lookalike", endpoint: "https://api.openai.com.evil/v1"},
+		{name: "insecure anthropic", endpoint: "http://api.anthropic.com/v1"},
+		{name: "insecure openai", endpoint: "http://api.openai.com/v1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfig(t, `{"provider":"http","endpoint":"`+tc.endpoint+`"}`)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.APIKey != tc.want {
+				t.Fatalf("api key = %q, want %q", cfg.APIKey, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadClearsInheritedModelWhenProviderChanges(t *testing.T) {
+	unsetEnv(t, "AUTOSKILLS_MODEL")
+	for _, tc := range []struct {
+		name     string
+		file     string
+		provider string
+	}{
+		{name: "http to codex", file: `{"provider":"http","model":"http-model"}`, provider: "codex"},
+		{name: "codex to claude", file: `{"provider":"codex","model":"codex-model"}`, provider: "claude"},
+		{name: "claude to http", file: `{"provider":"claude","model":"claude-model"}`, provider: "http"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfig(t, tc.file)
+			t.Setenv("AUTOSKILLS_PROVIDER", tc.provider)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Model != "" {
+				t.Fatalf("model = %q, want empty after provider change", cfg.Model)
+			}
+		})
+	}
+}
+
+func TestLoadKeepsExplicitEnvironmentModelWhenProviderChanges(t *testing.T) {
+	writeConfig(t, `{"provider":"http","model":"http-model"}`)
+	t.Setenv("AUTOSKILLS_PROVIDER", "codex")
+	t.Setenv("AUTOSKILLS_MODEL", "codex-model")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "codex-model" {
+		t.Fatalf("model = %q, want codex-model", cfg.Model)
+	}
+}
