@@ -3,11 +3,13 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/elcruzo/autoskills/internal/outbound"
 )
@@ -58,6 +60,15 @@ func TestNewRejectsUnvettedEndpoint(t *testing.T) {
 	}
 }
 
+func TestNewRequiresAPIKeyOnlyForRemoteHTTP(t *testing.T) {
+	if _, err := New("https://api.example.com/v1", "", "m"); err == nil || !strings.Contains(err.Error(), "API key") {
+		t.Fatalf("remote keyless provider error = %v", err)
+	}
+	if _, err := New("http://127.0.0.1:11434/v1", "", "m"); err != nil {
+		t.Fatalf("loopback keyless provider error = %v", err)
+	}
+}
+
 type recordingTransport struct {
 	calls int
 }
@@ -82,7 +93,7 @@ func TestChatRefusesUnvettedEndpointBeforeAnyRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Chat(context.Background(), p); err == nil {
+	if _, err := c.Generate(context.Background(), p); err == nil {
 		t.Fatal("Chat must refuse an unvetted endpoint")
 	}
 	if rt.calls != 0 {
@@ -113,7 +124,7 @@ func TestChatBodyCarriesOnlyThePayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := c.Chat(context.Background(), p)
+	out, err := c.Generate(context.Background(), p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,10 +171,64 @@ func TestChatDoesNotFollowRedirects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Chat(context.Background(), p); err == nil {
+	if _, err := c.Generate(context.Background(), p); err == nil {
 		t.Fatal("redirected provider response must be refused")
 	}
 	if unsafeCalls != 0 || unsafeAuth != "" {
 		t.Fatalf("redirect target received %d requests with auth %q", unsafeCalls, unsafeAuth)
+	}
+}
+
+func TestGenerateRejectsEmptyHTTPOutput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"  "}}]}`))
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "", "test-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b outbound.Builder
+	b.Static("user")
+	p, err := b.Build("system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Generate(context.Background(), p); !errors.Is(err, ErrEmptyOutput) {
+		t.Fatalf("empty provider output error = %v", err)
+	}
+}
+
+type contextBlockingTransport struct{}
+
+func (contextBlockingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	<-request.Context().Done()
+	return nil, request.Context().Err()
+}
+
+func TestHTTPProviderPropagatesCancellationAndTimeout(t *testing.T) {
+	provider, err := New("http://127.0.0.1:1", "", "test-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.HTTP.Transport = contextBlockingTransport{}
+	var builder outbound.Builder
+	builder.Static("user")
+	payload, err := builder.Build("system")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := provider.Generate(canceled, payload); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error = %v", err)
+	}
+
+	provider.HTTP.Timeout = 10 * time.Millisecond
+	timed, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer stop()
+	if _, err := provider.Generate(timed, payload); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error = %v", err)
 	}
 }

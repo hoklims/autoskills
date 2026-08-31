@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -85,5 +86,42 @@ func TestBuildRefusesEmpty(t *testing.T) {
 	c.Static("user text")
 	if _, err := c.Build("  "); err == nil {
 		t.Fatal("expected empty system prompt to be refused")
+	}
+}
+
+func TestBuildWithOutputSchemaKeepsSchemaInsidePayload(t *testing.T) {
+	const schema = `{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}`
+	var b Builder
+	b.Static("user")
+	excluded := t.TempDir()
+	p, err := b.BuildWithOutputSchema("system", schema, excluded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.OutputSchema() != schema {
+		t.Fatalf("schema = %q", p.OutputSchema())
+	}
+	if len(p.ExcludedRoots()) != 1 || p.ExcludedRoots()[0] != excluded {
+		t.Fatalf("excluded roots = %#v", p.ExcludedRoots())
+	}
+	if _, err := b.BuildWithOutputSchema("system", "not json"); err == nil {
+		t.Fatal("invalid output schema must fail before reaching a provider")
+	}
+}
+
+func TestBuildSanitizesEveryProviderVisibleField(t *testing.T) {
+	const secret = "sk-ant-api03-eeeeeeeeeeeeeeeeeeeeeeee"
+	var builder Builder
+	builder.Static("user")
+	schema := `{"type":"object","description":"` + secret + `","additionalProperties":false}`
+	payload, err := builder.BuildWithOutputSchema("system "+secret, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(payload.System(), secret) || strings.Contains(payload.OutputSchema(), secret) {
+		t.Fatal("provider-visible payload field bypassed redaction")
+	}
+	if !json.Valid([]byte(payload.OutputSchema())) {
+		t.Fatalf("sanitized schema is invalid: %s", payload.OutputSchema())
 	}
 }

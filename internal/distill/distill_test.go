@@ -3,6 +3,7 @@ package distill
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +14,70 @@ import (
 
 	"github.com/elcruzo/autoskills/internal/canon"
 	"github.com/elcruzo/autoskills/internal/llm"
+	"github.com/elcruzo/autoskills/internal/outbound"
 )
+
+type schemaProvider struct {
+	schemas []string
+}
+
+type retryFailureProvider struct {
+	calls int
+	err   error
+}
+
+func (p *retryFailureProvider) Generate(context.Context, outbound.Payload) (string, error) {
+	p.calls++
+	if p.calls == 1 {
+		return "not json", nil
+	}
+	return "", p.err
+}
+
+func TestCorrectiveRetryPropagatesProviderFailure(t *testing.T) {
+	for _, providerErr := range []error{context.Canceled, context.DeadlineExceeded, llm.ErrNotAuthenticated} {
+		provider := &retryFailureProvider{err: providerErr}
+		distiller := &Distiller{Provider: provider}
+		_, err := distiller.Session(context.Background(), hostileSession(""))
+		if !errors.Is(err, providerErr) {
+			t.Fatalf("provider error %v became %v", providerErr, err)
+		}
+		if provider.calls != 2 {
+			t.Fatalf("provider calls = %d", provider.calls)
+		}
+	}
+}
+
+func (p *schemaProvider) Generate(_ context.Context, payload outbound.Payload) (string, error) {
+	p.schemas = append(p.schemas, payload.OutputSchema())
+	if strings.Contains(payload.System(), "gardener") {
+		return `{"actions":[]}`, nil
+	}
+	return `{"suggestions":[]}`, nil
+}
+
+func TestDistillationOperationsAttachClosedOutputSchemas(t *testing.T) {
+	provider := &schemaProvider{}
+	d := &Distiller{Provider: provider}
+	_, err := d.Session(context.Background(), hostileSession(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "AGENTS.md"), "<!-- autoskills:begin id=sg_b group=conventions conf=0.80 -->\n#### T\n\n- body\n<!-- autoskills:end id=sg_b -->\n")
+	_, err = d.Garden(context.Background(), repo, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.schemas) != 2 || !strings.Contains(provider.schemas[0], `"suggestions"`) || !strings.Contains(provider.schemas[1], `"actions"`) {
+		t.Fatalf("schemas = %#v", provider.schemas)
+	}
+	for _, schema := range provider.schemas {
+		if !json.Valid([]byte(schema)) || !strings.Contains(schema, `"additionalProperties":false`) {
+			t.Fatalf("schema is not closed JSON: %s", schema)
+		}
+	}
+}
 
 // fakeProvider stands in for the configured endpoint and keeps the exact request bodies, so the
 // assertions inspect what actually left the process — not a mocked value.
@@ -22,7 +86,7 @@ type fakeProvider struct {
 	bodies []string
 }
 
-func newFakeProvider(t *testing.T, replies ...string) (*fakeProvider, *llm.Client) {
+func newFakeProvider(t *testing.T, replies ...string) (*fakeProvider, llm.Provider) {
 	t.Helper()
 	fp := &fakeProvider{}
 	n := 0
@@ -94,7 +158,7 @@ func TestSessionOutboundCarriesNoSecrets(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "CLAUDE.md"), "deploy via https://wiki.corp.internal/secret-runbook\n")
 
 	fp, client := newFakeProvider(t)
-	d := &Distiller{Client: client}
+	d := &Distiller{Provider: client}
 	if _, err := d.Session(context.Background(), hostileSession(repo)); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +198,7 @@ func TestInjectedTranscriptCannotChooseStatusOrPlacement(t *testing.T) {
 		`"evidence":["we always use pnpm in this repo, never npm"]}]}`
 	_, client := newFakeProvider(t, reply)
 
-	d := &Distiller{Client: client}
+	d := &Distiller{Provider: client}
 	got, err := d.Session(context.Background(), hostileSession(repo))
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +242,7 @@ func TestInvalidSchemaIsDroppedNotCoerced(t *testing.T) {
 		`]}`
 	_, client := newFakeProvider(t, reply)
 
-	d := &Distiller{Client: client}
+	d := &Distiller{Provider: client}
 	got, err := d.Session(context.Background(), hostileSession(repo))
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +261,7 @@ func TestEvidenceMustMatchTheSanitizedTranscript(t *testing.T) {
 		`"evidence":["export ANTHROPIC_API_KEY=sk-ant-api03-dddddddddddddddddddddddd"]}]}`
 	_, client := newFakeProvider(t, reply)
 
-	d := &Distiller{Client: client}
+	d := &Distiller{Provider: client}
 	got, err := d.Session(context.Background(), hostileSession(repo))
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +281,7 @@ func TestStrictResponseRejectsUnknownFieldsAndWrappers(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, client := newFakeProvider(t, reply, reply)
-			d := &Distiller{Client: client}
+			d := &Distiller{Provider: client}
 			if _, err := d.Session(context.Background(), hostileSession(repo)); err == nil {
 				t.Fatal("non-canonical provider JSON must be rejected")
 			}
@@ -238,7 +302,7 @@ func TestGardenOutboundIsRedacted(t *testing.T) {
 		`"body":"- tightened","rationale":"too verbose","confidence":0.9}]}`
 	fp, client := newFakeProvider(t, reply)
 
-	d := &Distiller{Client: client}
+	d := &Distiller{Provider: client}
 	got, err := d.Garden(context.Background(), repo, "demo")
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +341,7 @@ func TestGardenDropsInvalidActions(t *testing.T) {
 		`]}`
 	_, client := newFakeProvider(t, reply)
 
-	d := &Distiller{Client: client}
+	d := &Distiller{Provider: client}
 	got, err := d.Garden(context.Background(), repo, "demo")
 	if err != nil {
 		t.Fatal(err)

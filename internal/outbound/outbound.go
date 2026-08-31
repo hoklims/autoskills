@@ -4,12 +4,15 @@
 // markers and bounds size. The assembled payload is redacted once more at Build time, so a caller
 // that forgets the discipline still cannot hand a credential-shaped string to a provider.
 //
-// llm.Client.Chat accepts only a Payload, whose fields are unexported: there is no way to reach
+// llm.Provider.Generate accepts only a Payload, whose fields are unexported: there is no way to reach
 // the wire from outside this package.
 package outbound
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
@@ -24,6 +27,10 @@ const truncationMark = "\n…[truncated]\n"
 
 // ErrEmpty is returned when a payload would carry no instruction at all.
 var ErrEmpty = errors.New("outbound: refusing to send an empty payload")
+
+var ErrInvalidOutputSchema = errors.New("outbound: invalid output schema")
+
+var ErrInvalidExcludedRoot = errors.New("outbound: invalid excluded root")
 
 // neutralizer defangs the control markers a transcript could use to close AutoSkills' own
 // delimiters or to smuggle managed-block syntax into a suggestion body. The text stays readable
@@ -45,14 +52,18 @@ func Sanitize(s string) string {
 	return neutralizer.Replace(redact.Text(s))
 }
 
-// Payload is the only value llm.Client.Chat accepts. It can be produced solely by Builder.Build.
+// Payload is the only value llm.Provider.Generate accepts. It can be produced solely by Builder.Build.
 type Payload struct {
 	system string
 	user   string
+	schema string
+	roots  []string
 }
 
-func (p Payload) System() string { return p.system }
-func (p Payload) User() string   { return p.user }
+func (p Payload) System() string          { return p.system }
+func (p Payload) User() string            { return p.user }
+func (p Payload) OutputSchema() string    { return p.schema }
+func (p Payload) ExcludedRoots() []string { return append([]string(nil), p.roots...) }
 
 // Builder assembles a prompt out of two kinds of text, and only two:
 //
@@ -103,11 +114,40 @@ func (b *Builder) write(s string) {
 // dynamic byte and is redacted one final time — the defense that makes the boundary an invariant
 // rather than a convention.
 func (b *Builder) Build(system string) (Payload, error) {
+	return b.build(system, "")
+}
+
+func (b *Builder) BuildWithOutputSchema(system, schema string, excludedRoots ...string) (Payload, error) {
+	schema = Sanitize(schema)
+	if !json.Valid([]byte(schema)) {
+		return Payload{}, ErrInvalidOutputSchema
+	}
+	roots := make([]string, 0, len(excludedRoots))
+	for _, root := range excludedRoots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		absolute, err := filepath.Abs(root)
+		if err != nil {
+			return Payload{}, fmt.Errorf("%w: %v", ErrInvalidExcludedRoot, err)
+		}
+		roots = append(roots, filepath.Clean(absolute))
+	}
+	payload, err := b.build(system, schema)
+	if err != nil {
+		return Payload{}, err
+	}
+	payload.roots = roots
+	return payload, nil
+}
+
+func (b *Builder) build(system, schema string) (Payload, error) {
+	system = Sanitize(system)
 	user := redact.Text(b.sb.String())
 	if strings.TrimSpace(system) == "" || strings.TrimSpace(user) == "" {
 		return Payload{}, ErrEmpty
 	}
-	return Payload{system: system, user: user}, nil
+	return Payload{system: system, user: user, schema: schema}, nil
 }
 
 // cutBytes truncates to at most n bytes without splitting a UTF-8 rune.

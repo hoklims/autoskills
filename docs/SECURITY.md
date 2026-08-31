@@ -85,8 +85,9 @@
 
 ## Fermé par HOK-539
 
-- tout payload provider est construit par `internal/outbound`: redaction, neutralisation des marqueurs et bornes de taille sur chaque valeur dynamique, puis redaction de l’ensemble assemblé. `llm.Client.Chat` n’accepte plus qu’un `outbound.Payload`, dont les champs sont non exportés;
+- tout payload provider est construit par `internal/outbound`: redaction, neutralisation des marqueurs et bornes de taille sur chaque valeur dynamique, puis redaction de l’ensemble assemblé. `llm.Provider.Generate` n’accepte plus qu’un `outbound.Payload`, dont les champs sont non exportés;
 - les chemins transcript, contexte de dépôt (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules`), métadonnées de session et blocs gérés du gardener passent tous par cette préparation unique;
+- le provider Codex utilise un `CODEX_HOME` temporaire neutre et séparé du working directory, et y place uniquement le `auth.json` existant pour conserver l'authentification par abonnement: lien symbolique quand disponible, copie `0600`/home `0700` en fallback hors Windows; Windows exige le support des liens symboliques plutôt que créer une copie sans ACL équivalente; il ne parse ni ne journalise ce fichier, mais cette exception constitue un accès explicite au credential;
 - l’endpoint est validé avant la construction de toute requête portant la clé: HTTPS pour le distant, HTTP uniquement sur loopback, ni userinfo ni schéma inattendu; les redirects sont refusés pour éviter de rejouer corps et credentials vers une autre autorité;
 - l’auto-accept est supprimé. `auto_accept_threshold` reste parsé pour compatibilité, n’écrit jamais, et déclenche un avertissement explicite au scan;
 - réponse provider décodée comme un unique objet JSON sans champs inconnus, puis validée contre un schéma fermé (enums vérifiés et non coercés, champs requis, bornes de taille, confiance dans `[0,1]`, preuves vérifiées verbatim contre le texte réellement envoyé); scope, placement et destination sont déterminés localement et les valeurs provider correspondantes sont ignorées;

@@ -1,6 +1,4 @@
 // Package config loads ~/.autoskills/config.json with environment-variable overrides.
-// The LLM is always an OpenAI-compatible endpoint (PRD §10.4): Anthropic, OpenAI, a corporate
-// gateway, or local Ollama all satisfy the same three fields.
 package config
 
 import (
@@ -13,6 +11,7 @@ import (
 )
 
 type Config struct {
+	Provider string `json:"provider"`
 	// LLM endpoint base, e.g. "https://api.openai.com/v1", "https://api.anthropic.com/v1",
 	// "http://localhost:11434/v1" (Ollama).
 	Endpoint string `json:"endpoint"`
@@ -55,6 +54,7 @@ func Path() string { return filepath.Join(Dir(), "config.json") }
 
 func defaults() Config {
 	return Config{
+		Provider:              "http",
 		Endpoint:              "https://api.anthropic.com/v1",
 		Model:                 "claude-sonnet-4-5",
 		MaxSuggestionsPerScan: 10,
@@ -63,16 +63,21 @@ func defaults() Config {
 }
 
 // Load reads the config file if present, then applies env overrides:
-// AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL.
+// AUTOSKILLS_PROVIDER, AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL.
 // Falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY when no key is configured
 // (matching the endpoint's provider when recognizable).
 func Load() (Config, error) {
 	cfg := defaults()
+	modelConfigured := false
 	raw, err := os.ReadFile(Path())
 	switch {
 	case err == nil:
 		if jerr := json.Unmarshal(raw, &cfg); jerr != nil {
 			return cfg, fmt.Errorf("parse %s: %w", Path(), jerr)
+		}
+		var fields map[string]json.RawMessage
+		if jerr := json.Unmarshal(raw, &fields); jerr == nil {
+			_, modelConfigured = fields["model"]
 		}
 	case errors.Is(err, os.ErrNotExist):
 		// fine — defaults + env
@@ -80,6 +85,19 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 
+	if v := os.Getenv("AUTOSKILLS_PROVIDER"); v != "" {
+		cfg.Provider = v
+	}
+	cfg.Provider = strings.ToLower(strings.TrimSpace(cfg.Provider))
+	if cfg.Provider == "" {
+		cfg.Provider = "http"
+	}
+	if cfg.Provider != "http" && cfg.Provider != "codex" && cfg.Provider != "claude" {
+		return cfg, fmt.Errorf("unknown LLM provider %q: expected http, codex, or claude", cfg.Provider)
+	}
+	if cfg.Provider != "http" && !modelConfigured && os.Getenv("AUTOSKILLS_MODEL") == "" {
+		cfg.Model = ""
+	}
 	if v := os.Getenv("AUTOSKILLS_ENDPOINT"); v != "" {
 		cfg.Endpoint = v
 	}
@@ -89,7 +107,7 @@ func Load() (Config, error) {
 	if v := os.Getenv("AUTOSKILLS_API_KEY"); v != "" {
 		cfg.APIKey = v
 	}
-	if cfg.APIKey == "" {
+	if cfg.Provider == "http" && cfg.APIKey == "" {
 		// match the provider key to the endpoint; never send one provider's key to another
 		anthropicEndpoint := strings.Contains(cfg.Endpoint, "anthropic")
 		if v := os.Getenv("ANTHROPIC_API_KEY"); v != "" && anthropicEndpoint {

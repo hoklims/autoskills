@@ -95,11 +95,12 @@ scan flags:
   --max N          max sessions to distill this run (default 20)
   --dry-run        parse and report; no LLM calls, nothing stored
 
-config: ~/.autoskills/config.json  (endpoint, api_key, model, trigger_phrase,
+config: ~/.autoskills/config.json  (provider, endpoint, api_key, model, trigger_phrase,
         section_budget_bytes, daemon_interval_minutes, …)
+        provider: http (default/legacy), codex, or claude
         endpoint must be https, or http on loopback for a local model
         auto_accept_threshold is DEPRECATED and ignored: nothing is written without review
-env:    AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL
+env:    AUTOSKILLS_PROVIDER, AUTOSKILLS_ENDPOINT, AUTOSKILLS_API_KEY, AUTOSKILLS_MODEL
         (falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY)
 `)
 }
@@ -110,6 +111,19 @@ func adapters() ([]collector.Adapter, map[string]string) {
 		"claude": collector.HomePath(".claude", "projects"),
 	}
 	return []collector.Adapter{cursor.New(roots["cursor"]), claude.New(roots["claude"])}, roots
+}
+
+func configuredProvider(cfg config.Config) (llm.Provider, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
+	case "", "http":
+		return llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model)
+	case "codex":
+		return llm.NewCodex(cfg.Model)
+	case "claude":
+		return llm.NewClaude(cfg.Model)
+	default:
+		return nil, fmt.Errorf("unknown LLM provider %q: expected http, codex, or claude", cfg.Provider)
+	}
 }
 
 func cmdScan(args []string) error {
@@ -159,9 +173,6 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 		}
 	}
 
-	if !opts.dryRun && cfg.APIKey == "" {
-		return fmt.Errorf("no API key: set AUTOSKILLS_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY), or add api_key to %s", config.Path())
-	}
 	// Automatic acceptance was removed (HOK-539): a model-authored file write with no human in the
 	// loop is not a tuning dial. A configured threshold is honoured as "still parses", never as
 	// "still writes" — and the operator is told so on every scan rather than silently ignored.
@@ -181,12 +192,12 @@ func runScan(ctx context.Context, cfg config.Config, st *store.Store, opts scanO
 	var d *distill.Distiller
 	if !opts.dryRun {
 		// endpoint policy is enforced before a client exists: no key travels to an unvetted host
-		client, err := llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model)
+		provider, err := configuredProvider(cfg)
 		if err != nil {
 			return err
 		}
 		d = &distill.Distiller{
-			Client:        client,
+			Provider:      provider,
 			Store:         st,
 			MinConfidence: cfg.MinConfidence,
 			SeenContent:   seenContent,
@@ -622,9 +633,6 @@ func cmdGarden(args []string) error {
 	if err != nil {
 		return err
 	}
-	if cfg.APIKey == "" {
-		return fmt.Errorf("no API key configured")
-	}
 	st, err := store.Open(store.DefaultPath())
 	if err != nil {
 		return err
@@ -635,11 +643,11 @@ func cmdGarden(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	client, err := llm.New(cfg.Endpoint, cfg.APIKey, cfg.Model)
+	provider, err := configuredProvider(cfg)
 	if err != nil {
 		return err
 	}
-	d := &distill.Distiller{Client: client, Store: st, MinConfidence: cfg.MinConfidence}
+	d := &distill.Distiller{Provider: provider, Store: st, MinConfidence: cfg.MinConfidence}
 	suggestions, err := d.Garden(ctx, repoRoot, filepath.Base(repoRoot))
 	if err != nil {
 		return err

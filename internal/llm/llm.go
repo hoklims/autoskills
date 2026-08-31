@@ -1,6 +1,4 @@
-// Package llm is a minimal OpenAI-compatible chat-completions client. AutoSkills is never in
-// the inference path (PRD §10.4): the endpoint is whatever the user configures — Anthropic,
-// OpenAI, a corporate gateway, or local Ollama — all speaking the same wire shape.
+// Package llm provides inference through HTTP chat completions or authenticated official CLIs.
 package llm
 
 import (
@@ -25,11 +23,15 @@ type Client struct {
 	HTTP     *http.Client
 }
 
+type Provider interface {
+	Generate(context.Context, outbound.Payload) (string, error)
+}
+
 // New validates the endpoint before returning a client: no request carrying the provider key is
 // ever built against an unvetted destination.
 func New(endpoint, apiKey, model string) (*Client, error) {
 	ep := strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	if err := ValidateEndpoint(ep); err != nil {
+	if err := validateHTTPConfiguration(ep, apiKey); err != nil {
 		return nil, err
 	}
 	return &Client{
@@ -38,6 +40,20 @@ func New(endpoint, apiKey, model string) (*Client, error) {
 		Model:    model,
 		HTTP:     &http.Client{Timeout: 180 * time.Second},
 	}, nil
+}
+
+func validateHTTPConfiguration(endpoint, apiKey string) error {
+	if err := ValidateEndpoint(endpoint); err != nil {
+		return err
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("llm: endpoint is not a valid URL")
+	}
+	if strings.TrimSpace(apiKey) == "" && !isLoopback(parsed.Hostname()) {
+		return fmt.Errorf("llm: no API key configured for remote HTTP provider")
+	}
+	return nil
 }
 
 // ValidateEndpoint bounds where the provider key may travel: TLS for anything remote, plaintext
@@ -109,11 +125,11 @@ type chatResponse struct {
 	} `json:"error"`
 }
 
-// Chat sends a prepared payload and returns the assistant text. Retries transient failures.
+// Generate sends a prepared payload and returns the assistant text. Retries transient failures.
 // The parameter type is the boundary: only internal/outbound can produce a Payload, so nothing
 // unredacted can reach the request body from here.
-func (c *Client) Chat(ctx context.Context, p outbound.Payload) (string, error) {
-	if err := ValidateEndpoint(c.Endpoint); err != nil {
+func (c *Client) Generate(ctx context.Context, p outbound.Payload) (string, error) {
+	if err := validateHTTPConfiguration(c.Endpoint, c.APIKey); err != nil {
 		return "", err
 	}
 	req := chatRequest{
@@ -140,6 +156,9 @@ func (c *Client) Chat(ctx context.Context, p outbound.Payload) (string, error) {
 			}
 		}
 		out, retryable, err := c.once(ctx, body)
+		if err == nil && strings.TrimSpace(out) == "" {
+			return "", ErrEmptyOutput
+		}
 		if err == nil {
 			return out, nil
 		}

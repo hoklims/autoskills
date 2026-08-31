@@ -29,6 +29,8 @@ Rules:
 Respond with ONLY a JSON object, no fences:
 {"actions":[{"type":"amend|prune","block_id":"sg_x","title":"...","body":"...","rationale":"...","confidence":0.0}]}`
 
+const gardenOutputSchema = `{"type":"object","properties":{"actions":{"type":"array","items":{"type":"object","properties":{"type":{"type":"string","enum":["amend","prune"]},"block_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"rationale":{"type":"string"},"confidence":{"type":"number"}},"required":["type","block_id","title","body","rationale","confidence"],"additionalProperties":false}}},"required":["actions"],"additionalProperties":false}`
+
 type gardenAction struct {
 	Type       string   `json:"type"`
 	BlockID    string   `json:"block_id"`
@@ -88,11 +90,11 @@ func (d *Distiller) Garden(ctx context.Context, repoRoot, project string) ([]sto
 	}
 	ob.Static("\nTASK: propose amend/prune actions per your system instructions. JSON only.")
 
-	payload, err := ob.Build(gardenSystemPrompt)
+	payload, err := ob.BuildWithOutputSchema(gardenSystemPrompt, gardenOutputSchema, repoRoot)
 	if err != nil {
 		return nil, err
 	}
-	out, err := d.Client.Chat(ctx, payload)
+	out, err := d.Provider.Generate(ctx, payload)
 	if err != nil {
 		return nil, err
 	}

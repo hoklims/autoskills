@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,8 +14,55 @@ import (
 	"time"
 
 	"github.com/elcruzo/autoskills/internal/config"
+	"github.com/elcruzo/autoskills/internal/llm"
 	"github.com/elcruzo/autoskills/internal/store"
 )
+
+func TestConfiguredProviderSelection(t *testing.T) {
+	if _, err := configuredProvider(config.Config{Provider: "http", Endpoint: "http://localhost:11434/v1"}); err != nil {
+		t.Fatalf("keyless loopback HTTP provider: %v", err)
+	}
+	if _, err := configuredProvider(config.Config{Provider: "unknown"}); err == nil {
+		t.Fatal("unknown provider must fail")
+	}
+	t.Setenv("PATH", t.TempDir())
+	for _, name := range []string{"codex", "claude"} {
+		if _, err := configuredProvider(config.Config{Provider: name}); !errors.Is(err, llm.ErrCLIUnavailable) {
+			t.Fatalf("%s missing CLI error = %v", name, err)
+		}
+	}
+}
+
+func TestCodexScanSmoke(t *testing.T) {
+	if os.Getenv("AUTOSKILLS_CODEX_SCAN_SMOKE") == "" {
+		t.Skip("set AUTOSKILLS_CODEX_SCAN_SMOKE=1 to run a scan with the authenticated Codex CLI")
+	}
+	codexHome := os.Getenv("CODEX_HOME")
+	if codexHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		codexHome = filepath.Join(home, ".codex")
+	}
+	home := t.TempDir()
+	repo := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("CODEX_HOME", codexHome)
+	plantClaudeTranscript(t, home, repo)
+	storage, err := store.Open(filepath.Join(t.TempDir(), "scan.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cfg := config.Config{Provider: "codex", MaxSuggestionsPerScan: 10, MinConfidence: 0.5, SectionBudgetBytes: 12000}
+	if err := runScan(ctx, cfg, storage, scanOptions{since: time.Hour, maxSessions: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 const evidenceLine = "we always use pnpm in this repo, never npm — the preinstall hook redirects"
 

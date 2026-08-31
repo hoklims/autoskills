@@ -33,7 +33,7 @@ Claude JSONL ─┘                                      │
 | `internal/canon` | Session commune minimale | Les tools, résultats, erreurs, fichiers et outcomes ne forment pas encore un modèle explicite. |
 | `internal/distill` | Préfiltre, prompt, validation de schéma et d’evidence, gardening | Une session utile devient directement une suggestion, sans `Experience` intermédiaire. Depuis HOK-539, tout egress (transcript, contexte existant, garden) passe par `internal/outbound`. |
 | `internal/outbound` | Unique préparation du payload provider: redaction, neutralisation des marqueurs, bornes | Frontière de type, pas de sandbox: la redaction reste heuristique. |
-| `internal/llm` | Appel HTTP au format chat completions, policy d’endpoint | Le code suppose une compatibilité OpenAI et mélange les en-têtes de providers. |
+| `internal/llm` | Interface d’inférence et providers HTTP chat-completions, Codex CLI, Claude Code CLI | Les CLIs conservent leur comportement système/auth interne; le provider HTTP mélange les en-têtes compatibles. |
 | `internal/store` | SQLite local pour checkpoints et suggestions | Pas de version de schéma ni de transaction unique entre checkpoint et suggestion. |
 | `internal/writer` | Placement et mise à jour des artefacts runtime | Écritures directes, multi-fichiers non atomiques, destinations surtout Cursor, rollback incomplet. |
 | `internal/server` | API locale et UI embarquée | Loopback par défaut, mais exposition possible sans barrière Origin/token/limites. |
@@ -42,7 +42,7 @@ Claude JSONL ─┘                                      │
 ## Problèmes structurants
 
 1. ~~**La transcript traverse trop de niveaux de confiance.**~~ Fermé par HOK-539: le LLM propose uniquement le contenu sémantique; scope, placement, statut et plan d’artefact sont déterminés localement, puis un humain accepte avant toute écriture. Plus aucun script n’est extrait d’un bloc shell.
-2. ~~**L’egress n’a pas une frontière unique.**~~ Fermé par HOK-539: `internal/outbound` est le seul constructeur de payload, et `llm.Client.Chat` n’accepte rien d’autre.
+2. ~~**L’egress n’a pas une frontière unique.**~~ Fermé par HOK-539: `internal/outbound` est le seul constructeur de payload, et `llm.Provider.Generate` n’accepte rien d’autre.
 3. **La persistance n’est pas transactionnelle de bout en bout.** Le checkpoint peut avancer avant l’insertion d’une suggestion; le filesystem et SQLite peuvent diverger.
 4. **La suggestion remplace l’Experience.** Le système ne conserve pas un fait intermédiaire stable, dédupliqué et explicable.
 5. **Le registry et les outputs runtime sont confondus.** Une connaissance canonique devrait précéder les adapters Claude, Codex et Cursor.
