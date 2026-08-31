@@ -129,7 +129,7 @@ func (p *cliProvider) generateCodex(ctx context.Context, dir string, payload out
 	}
 	args = append(args, "--cd", dir, "--output-schema", schemaPath, "--output-last-message", outputPath, "-")
 	stdin := "SYSTEM INSTRUCTIONS:\n" + payload.System() + "\n\nUSER MESSAGE:\n" + payload.User()
-	if _, err := p.run(ctx, dir, args, stdin, map[string]string{"CODEX_HOME": codexHome}); err != nil {
+	if _, err := p.run(ctx, dir, args, stdin, stdin, map[string]string{"CODEX_HOME": codexHome}); err != nil {
 		return "", err
 	}
 	raw, err := readBoundedFile(outputPath, maxCLIOutputBytes)
@@ -152,7 +152,8 @@ func (p *cliProvider) generateClaude(ctx context.Context, dir string, payload ou
 		args = append(args, "--model", p.model)
 	}
 	args = append(args, "--system-prompt-file", systemPromptPath)
-	stdout, err := p.run(ctx, dir, args, payload.User(), nil)
+	sensitiveInput := payload.System() + "\n" + payload.User()
+	stdout, err := p.run(ctx, dir, args, payload.User(), sensitiveInput, nil)
 	if err != nil {
 		return "", err
 	}
@@ -169,7 +170,7 @@ func (p *cliProvider) generateClaude(ctx context.Context, dir string, payload ou
 	return validateStructuredOutput("claude", []byte(envelope.Result))
 }
 
-func (p *cliProvider) run(ctx context.Context, dir string, args []string, stdin string, environment map[string]string) ([]byte, error) {
+func (p *cliProvider) run(ctx context.Context, dir string, args []string, stdin, sensitiveInput string, environment map[string]string) ([]byte, error) {
 	commandArgs := append(append([]string{}, p.command[1:]...), args...)
 	cmd := exec.CommandContext(ctx, p.command[0], commandArgs...)
 	isolateCommandProcess(cmd)
@@ -190,10 +191,10 @@ func (p *cliProvider) run(ctx context.Context, dir string, args []string, stdin 
 	}
 	if err != nil {
 		sanitizedStderr := outbound.Sanitize(stderr.String())
-		if cliFailureLooksUnauthenticated(p.kind, sanitizedStderr, stdout.Bytes(), stdin) {
+		if cliFailureLooksUnauthenticated(p.kind, sanitizedStderr, stdout.Bytes(), sensitiveInput) {
 			return nil, fmt.Errorf("%w: %s", ErrNotAuthenticated, p.kind)
 		}
-		detail := safeCLIDetail(sanitizedStderr, stdin)
+		detail := safeCLIDetail(sanitizedStderr, sensitiveInput)
 		if detail == "" {
 			return nil, fmt.Errorf("llm: %s exited non-zero: %w", p.kind, err)
 		}
@@ -285,23 +286,15 @@ func providerEnvironment(kind string, overrides map[string]string) []string {
 
 func providerEnvironmentVariableBlocked(kind, name string) bool {
 	name = strings.ToUpper(name)
-	if name == "RUST_LOG" || name == "RUST_BACKTRACE" || strings.HasPrefix(name, "OTEL_") {
+	if kind == "claude" && name == "CLAUDE_CONFIG_DIR" {
+		return false
+	}
+	if name == "RUST_LOG" || name == "RUST_BACKTRACE" || strings.HasPrefix(name, "OTEL_") || strings.HasPrefix(name, "CODEX_") || strings.HasPrefix(name, "OPENAI_") || strings.HasPrefix(name, "CLAUDE_") || strings.HasPrefix(name, "ANTHROPIC_") {
 		return true
 	}
-	switch kind {
-	case "codex":
-		return strings.HasPrefix(name, "CODEX_") || strings.HasPrefix(name, "OPENAI_")
-	case "claude":
-		if name == "CLAUDE_CONFIG_DIR" {
-			return false
-		}
-		if strings.HasPrefix(name, "CLAUDE_") || strings.HasPrefix(name, "ANTHROPIC_") {
-			return true
-		}
-		switch name {
-		case "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_TENANT_ID":
-			return true
-		}
+	switch name {
+	case "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_TENANT_ID":
+		return true
 	}
 	return false
 }
@@ -378,6 +371,12 @@ func neutralWorkingDirectory(excludedRoots []string) (string, error) {
 		_ = os.RemoveAll(createdDir)
 		return "", fmt.Errorf("llm: resolve neutral working directory: %w", err)
 	}
+	homeBoundary := ""
+	if home, homeErr := os.UserHomeDir(); homeErr == nil {
+		if resolvedHome, resolveErr := filepath.EvalSymlinks(home); resolveErr == nil {
+			homeBoundary = resolvedHome
+		}
+	}
 	roots := append([]string{}, excludedRoots...)
 	if filepath.Dir(callerDir) != callerDir {
 		roots = append(roots, callerDir)
@@ -406,6 +405,9 @@ func neutralWorkingDirectory(excludedRoots []string) (string, error) {
 		}
 	}
 	for current := dir; ; current = filepath.Dir(current) {
+		if homeBoundary != "" && samePath(current, homeBoundary) {
+			break
+		}
 		for _, name := range []string{"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", ".git", ".codex", ".claude"} {
 			_, statErr := os.Stat(filepath.Join(current, name))
 			switch {
@@ -423,6 +425,15 @@ func neutralWorkingDirectory(excludedRoots []string) (string, error) {
 		}
 	}
 	return dir, nil
+}
+
+func samePath(left, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 func pathWithinFilesystem(root, target string) (bool, error) {
@@ -459,15 +470,18 @@ func pathWithin(root, target string) bool {
 func safeCLIDetail(stderr, prompt string) string {
 	lines := strings.Split(stderr, "\n")
 	for _, line := range lines {
-		if message, ok := jsonMessage(line); ok && !detailContainsPromptData(message, prompt) {
-			return limitRunes(message, 500)
+		if message, ok := jsonMessage(line); ok {
+			message = limitRunes(message, 500)
+			if !detailContainsPromptData(message, prompt) {
+				return message
+			}
 		}
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
-		trimmed := strings.TrimSpace(lines[i])
+		trimmed := limitRunes(strings.TrimSpace(lines[i]), 500)
 		lower := strings.ToLower(trimmed)
 		if (strings.Contains(lower, "error") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "authentication") || strings.Contains(lower, "not logged in")) && !detailContainsPromptData(trimmed, prompt) {
-			return limitRunes(trimmed, 500)
+			return trimmed
 		}
 	}
 	return ""
@@ -519,12 +533,22 @@ func promptContainsDiagnostic(prompt, diagnostic string) bool {
 }
 
 func detailContainsPromptData(detail, prompt string) bool {
+	promptLower := strings.ToLower(prompt)
 	promptTokens := make(map[string]struct{})
-	for _, token := range textTokens(prompt) {
+	for _, token := range textTokens(promptLower) {
 		promptTokens[token] = struct{}{}
 	}
 	for _, token := range textTokens(detail) {
 		if _, present := promptTokens[token]; present {
+			return true
+		}
+		if len([]rune(token)) >= 4 && strings.Contains(promptLower, token) {
+			return true
+		}
+	}
+	detailLower := strings.ToLower(detail)
+	for token := range promptTokens {
+		if len([]rune(token)) >= 4 && strings.Contains(detailLower, token) {
 			return true
 		}
 	}

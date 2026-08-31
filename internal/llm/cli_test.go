@@ -68,7 +68,7 @@ func TestCLIHelper(t *testing.T) {
 		systemPrompt = string(raw)
 	}
 	var environmentLeaks []string
-	for _, name := range []string{"OPENAI_API_KEY", "OpenAI_API_KEY", "CODEX_ACCESS_TOKEN", "Codex_Home", "ANTHROPIC_API_KEY", "Anthropic_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AWS_SECRET_ACCESS_KEY", "RUST_LOG", "OTEL_EXPORTER_OTLP_ENDPOINT"} {
+	for _, name := range []string{"OPENAI_API_KEY", "OpenAI_API_KEY", "CODEX_ACCESS_TOKEN", "ANTHROPIC_API_KEY", "Anthropic_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AWS_SECRET_ACCESS_KEY", "RUST_LOG", "OTEL_EXPORTER_OTLP_ENDPOINT"} {
 		if _, present := os.LookupEnv(name); present {
 			environmentLeaks = append(environmentLeaks, name)
 		}
@@ -101,6 +101,12 @@ func TestCLIHelper(t *testing.T) {
 		os.Exit(8)
 	case "short-prompt-error":
 		_, _ = fmt.Fprint(os.Stderr, "Error: x7")
+		os.Exit(8)
+	case "system-prompt-error":
+		_, _ = fmt.Fprint(os.Stderr, "Error: system-private-customer-codename")
+		os.Exit(8)
+	case "prompt-partial-token-error":
+		_, _ = fmt.Fprint(os.Stderr, "Error: customerproject")
 		os.Exit(8)
 	case "large":
 		large := strings.Repeat("x", maxCLIOutputBytes+1)
@@ -141,7 +147,7 @@ func TestCLIHelper(t *testing.T) {
 		}
 		time.Sleep(5 * time.Second)
 	case "child-write":
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 		_ = os.WriteFile(os.Getenv("AUTOSKILLS_CHILD_MARKER"), []byte("survived"), 0o600)
 		os.Exit(0)
 	default:
@@ -207,6 +213,9 @@ func TestCodexProviderInvocationIsEphemeralAndNeutral(t *testing.T) {
 	t.Setenv("OpenAI_API_KEY", "must-not-reach-codex")
 	t.Setenv("CODEX_ACCESS_TOKEN", "must-not-reach-codex")
 	t.Setenv("Codex_Home", "must-not-reach-codex")
+	t.Setenv("ANTHROPIC_API_KEY", "must-not-reach-codex")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-reach-codex")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "must-not-reach-codex")
 	t.Setenv("RUST_LOG", "trace")
 	p := newTestCodexProvider(t, "gpt-test", time.Second)
 	payload := preparedPayload(t)
@@ -216,8 +225,7 @@ func TestCodexProviderInvocationIsEphemeralAndNeutral(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := decodeInvocation(t, out)
-	rel, _ := filepath.Rel(originalDir, got.Dir)
-	if rel == "." || !strings.HasPrefix(rel, "..") || !strings.Contains(filepath.Base(got.Dir), "autoskills-llm-") {
+	if pathWithin(originalDir, got.Dir) || !strings.Contains(filepath.Base(got.Dir), "autoskills-llm-") {
 		t.Fatalf("working directory is not neutral: %q", got.Dir)
 	}
 	wantPrefix := []string{"exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--strict-config", "-c", "project_doc_max_bytes=0", "-c", "mcp_servers={}", "--enable", "skip_host_skill_discovery", "--disable", "shell_tool", "--disable", "unified_exec", "--disable", "shell_snapshot", "--disable", "code_mode", "--disable", "code_mode_host", "--disable", "code_mode_only", "--disable", "multi_agent", "--disable", "browser_use", "--disable", "browser_use_external", "--disable", "browser_use_full_cdp_access", "--disable", "in_app_browser", "--disable", "computer_use", "--disable", "apps", "--disable", "plugins", "--disable", "plugin_sharing", "--disable", "remote_plugin", "--disable", "hooks", "--disable", "skill_search", "--disable", "skill_mcp_dependency_install", "--disable", "tool_suggest", "--disable", "tool_call_mcp_elicitation", "--disable", "auth_elicitation", "--disable", "goals", "--disable", "workspace_dependencies", "--disable", "in_app_chat", "--disable", "in_app_local_automation", "--disable", "in_app_updates", "--disable", "image_generation", "--disable", "view_image", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--model", "gpt-test", "--cd", got.Dir, "--output-schema"}
@@ -326,6 +334,9 @@ func TestClaudeProviderInvocationIsSafeAndNonPersistent(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "must-not-reach-claude")
 	t.Setenv("Anthropic_API_KEY", "must-not-reach-claude")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-reach-claude")
+	t.Setenv("OPENAI_API_KEY", "must-not-reach-claude")
+	t.Setenv("CODEX_ACCESS_TOKEN", "must-not-reach-claude")
+	t.Setenv("Codex_Home", "must-not-reach-claude")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "must-not-reach-claude")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "must-not-reach-claude")
 	p := newClaudeProvider(helperCommand(), "sonnet", time.Second)
@@ -361,6 +372,9 @@ func TestClaudeProviderInvocationIsSafeAndNonPersistent(t *testing.T) {
 	}
 	if len(got.EnvironmentLeaks) != 0 {
 		t.Fatalf("environment reached Claude: %v", got.EnvironmentLeaks)
+	}
+	if got.CodexHome != "" {
+		t.Fatalf("CODEX_HOME reached Claude: %q", got.CodexHome)
 	}
 }
 
@@ -433,7 +447,7 @@ func TestCLIProviderCancellationStopsDescendants(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout error = %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("descendant survived cancellation: %v", err)
 	}
@@ -443,6 +457,8 @@ func TestCLIProviderRefusesTemporaryDirectoryInsideExcludedRoot(t *testing.T) {
 	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
 	excluded := t.TempDir()
 	t.Setenv("TMPDIR", excluded)
+	t.Setenv("TMP", excluded)
+	t.Setenv("TEMP", excluded)
 	var builder outbound.Builder
 	builder.Static("user")
 	payload, err := builder.BuildWithOutputSchema("system", testOutputSchema, excluded)
@@ -480,6 +496,8 @@ func TestCLIProviderResolvesSymlinkedTemporaryRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("TMPDIR", alias)
+	t.Setenv("TMP", alias)
+	t.Setenv("TEMP", alias)
 	var builder outbound.Builder
 	builder.Static("user")
 	payload, err := builder.BuildWithOutputSchema("system", testOutputSchema, excluded)
@@ -502,6 +520,8 @@ func TestCLIProviderRefusesInstructionBearingTemporaryAncestor(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("TMPDIR", temporaryBase)
+	t.Setenv("TMP", temporaryBase)
+	t.Setenv("TEMP", temporaryBase)
 	if _, err := newTestCodexProvider(t, "", time.Second).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "configuration or instructions") {
 		t.Fatalf("error = %v", err)
 	}
@@ -518,8 +538,37 @@ func TestCLIProviderRefusesConfigurationBearingTemporaryAncestor(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("TMPDIR", temporaryBase)
+	t.Setenv("TMP", temporaryBase)
+	t.Setenv("TEMP", temporaryBase)
 	if _, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "configuration or instructions") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestCLIProviderAllowsUserConfigurationBoundary(t *testing.T) {
+	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	home := filepath.Join(t.TempDir(), "home")
+	temporaryBase := filepath.Join(home, "tmp")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "AGENTS.md"), []byte("global instructions"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(temporaryBase, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("TMPDIR", temporaryBase)
+	t.Setenv("TMP", temporaryBase)
+	t.Setenv("TEMP", temporaryBase)
+	out, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeInvocation(t, out).Dir; !pathWithin(home, got) {
+		t.Fatalf("working directory %q is outside user home %q", got, home)
 	}
 }
 
@@ -547,6 +596,8 @@ func TestCLIProviderRefusesTemporaryDirectoryInsideCallerTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
 	if _, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t)); err == nil || !strings.Contains(err.Error(), "neutral working directory") {
 		t.Fatalf("error = %v", err)
 	}
@@ -626,17 +677,21 @@ func TestCLIAuthenticationClassificationDoesNotEchoPrompt(t *testing.T) {
 func TestCLIErrorDoesNotEchoPromptFragments(t *testing.T) {
 	for _, tc := range []struct {
 		behavior string
-		prompt   string
+		system   string
+		user     string
+		leak     string
 	}{
-		{behavior: "prompt-error", prompt: "private-customer-project-codename"},
-		{behavior: "prompt-json-error", prompt: "private-customer-project-codename"},
-		{behavior: "short-prompt-error", prompt: "x7"},
+		{behavior: "prompt-error", system: "system", user: "private-customer-project-codename", leak: "private-customer-project-codename"},
+		{behavior: "prompt-json-error", system: "system", user: "private-customer-project-codename", leak: "private-customer-project-codename"},
+		{behavior: "short-prompt-error", system: "system", user: "x7", leak: "x7"},
+		{behavior: "system-prompt-error", system: "system-private-customer-codename", user: "user", leak: "system-private-customer-codename"},
+		{behavior: "prompt-partial-token-error", system: "privatecustomerprojectcodename", user: "user", leak: "customerproject"},
 	} {
 		t.Run(tc.behavior, func(t *testing.T) {
 			t.Setenv("AUTOSKILLS_CLI_HELPER", tc.behavior)
 			var builder outbound.Builder
-			builder.Data(tc.prompt, 0)
-			payload, err := builder.BuildWithOutputSchema("system", testOutputSchema)
+			builder.Data(tc.user, 0)
+			payload, err := builder.BuildWithOutputSchema(tc.system, testOutputSchema)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -644,7 +699,7 @@ func TestCLIErrorDoesNotEchoPromptFragments(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "exited non-zero") {
 				t.Fatalf("error = %v", err)
 			}
-			if strings.Contains(err.Error(), tc.prompt) {
+			if strings.Contains(err.Error(), tc.leak) {
 				t.Fatalf("error echoed prompt: %v", err)
 			}
 		})
