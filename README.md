@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Active development has moved to **[Temper](https://github.com/hoklims/temper)**, an independent standalone repository that preserves this project's Git history, MIT license, and attribution to [elcruzo/autoskills](https://github.com/elcruzo/autoskills). This legacy fork is archived for continuity and will not receive further updates.
+
 # autoskills
 
 Turn your AI coding sessions into reviewed, committed skills.
