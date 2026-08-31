@@ -11,114 +11,99 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/elcruzo/autoskills/internal/config"
 	"github.com/elcruzo/autoskills/internal/store"
 )
 
-// TargetPreview returns the repo-relative (or ~-relative) destination Write would choose,
-// so pending suggestions can show an honest target path in the review UI.
-func TargetPreview(g store.Suggestion) string {
-	if g.Scope == "machine" || g.RepoRoot == "" {
-		return "~/.autoskills/skills/" + slug(g.Title) + ".md"
-	}
-	switch g.Placement {
-	case "path_scoped":
-		return ".cursor/rules/autoskills-" + slug(g.Title) + ".mdc"
-	case "skill":
-		return ".cursor/skills/autoskills-" + slug(g.Title) + "/SKILL.md"
-	default:
-		return "AGENTS.md"
-	}
-}
-
-// Write places an accepted suggestion and returns the path written.
+// writeUnjournaled places a suggestion's artifact and returns the path written. It is atomic and
+// confined but NOT durable: nothing records that it happened, so a crash mid-mutation leaves a
+// state no reconciliation can resolve.
+//
+// It is deliberately unexported and has no production caller. Accept is the only way in, because
+// "write the file, then record the decision" is exactly the two-commit shape this package exists
+// to remove — and an exported non-durable door is an invitation to reintroduce it. What remains
+// here serves the tests that need a plain filesystem effect without a store.
+//
 // Sensitivity is deliberately NOT enforced here: the review card surfaces the SENSITIVE badge
 // and a human approved the write — the badge is the control (PRD §6.7).
 //
+// The destination is never read off the suggestion: BuildPlan recomputes it locally and refuses
+// anything outside the closed set of artifacts, so an invalid or out-of-tree plan is an error
+// rather than a file.
+func writeUnjournaled(g store.Suggestion) (string, error) {
+	mut, err := BuildMutation(g)
+	if err != nil {
+		return "", err
+	}
+	if err := capture(&mut); err != nil {
+		return "", err
+	}
+	if err := applyOps(&mut); err != nil {
+		if uErr := unwind(&mut); uErr != nil {
+			return "", fmt.Errorf("%w; %v", err, uErr)
+		}
+		return "", err
+	}
+	return mut.WrittenPath, nil
+}
+
+// BuildMutation computes every file an acceptance would touch and the exact bytes each would
+// hold. It reads the repository but writes nothing, so the plan can be journaled — and refused —
+// before the first mutation.
+//
 // Routing:
 //   - scope=machine                  -> ~/.autoskills/skills/<slug>.md
-//   - placement=path_scoped (repo)   -> <repo>/.cursor/rules/autoskills-<slug>.mdc (globs from TargetPath hint)
+//   - placement=path_scoped (repo)   -> <repo>/.cursor/rules/autoskills-<slug>.mdc
 //   - placement=skill (repo)         -> <repo>/.cursor/skills/autoskills-<slug>/SKILL.md
 //   - placement=always_on (repo)     -> managed block in <repo>/AGENTS.md (+ CLAUDE.md import line if needed)
-func Write(g store.Suggestion) (string, error) {
-	if g.Scope == "machine" || g.RepoRoot == "" {
-		return writeMachineSkill(g)
+func BuildMutation(g store.Suggestion) (Mutation, error) {
+	plan, err := BuildPlan(g)
+	if err != nil {
+		return Mutation{}, err
 	}
-	switch g.Placement {
-	case "path_scoped":
-		return writeCursorRule(g)
-	case "skill":
-		return writeRepoSkill(g)
+	switch plan.Kind {
+	case KindMachineSkill:
+		return singleFile(plan, fmt.Sprintf("# %s\n\n%s\n", g.Title, g.Body)), nil
+	case KindCursorRule:
+		content, err := cursorRuleContent(g)
+		if err != nil {
+			return Mutation{}, err
+		}
+		return singleFile(plan, content), nil
+	case KindRepoSkill:
+		return singleFile(plan, repoSkillContent(g)), nil
 	default:
-		return writeAgentsBlock(g)
+		return planAgentsBlock(g, plan)
 	}
 }
 
-func writeMachineSkill(g store.Suggestion) (string, error) {
-	dir := filepath.Join(config.Dir(), "skills")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
+func singleFile(plan Plan, content string) Mutation {
+	return Mutation{
+		Ops:         []FileOp{{Root: plan.Root, Path: plan.Path, Content: content}},
+		WrittenPath: plan.Path,
 	}
-	path := filepath.Join(dir, slug(g.Title)+".md")
-	content := fmt.Sprintf("# %s\n\n%s\n", g.Title, g.Body)
-	return path, os.WriteFile(path, []byte(content), 0o644)
 }
 
-func writeCursorRule(g store.Suggestion) (string, error) {
-	dir := filepath.Join(g.RepoRoot, ".cursor", "rules")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, "autoskills-"+slug(g.Title)+".mdc")
-
+func cursorRuleContent(g store.Suggestion) (string, error) {
 	globs := strings.TrimSpace(g.Globs)
+	if globs == "" {
+		return "", fmt.Errorf("writer: refusing a path_scoped rule without globs")
+	}
 	var fm strings.Builder
 	fm.WriteString("---\n")
 	fm.WriteString("description: " + yamlEscape(g.Title) + "\n")
-	if globs != "" {
-		// always quoted: bare globs starting with * are YAML aliases and would be invalid
-		fm.WriteString("globs: \"" + strings.ReplaceAll(globs, `"`, ``) + "\"\n")
-		fm.WriteString("alwaysApply: false\n")
-	} else {
-		fm.WriteString("alwaysApply: true\n")
-	}
+	// always quoted: bare globs starting with * are YAML aliases and would be invalid
+	fm.WriteString("globs: \"" + strings.ReplaceAll(globs, `"`, ``) + "\"\n")
+	fm.WriteString("alwaysApply: false\n")
 	fm.WriteString("---\n\n")
-	return path, os.WriteFile(path, []byte(fm.String()+g.Body+"\n"), 0o644)
+	return fm.String() + g.Body + "\n", nil
 }
 
-func writeRepoSkill(g store.Suggestion) (string, error) {
-	dir := filepath.Join(g.RepoRoot, ".cursor", "skills", "autoskills-"+slug(g.Title))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, "SKILL.md")
-	body := g.Body
-
-	// loop-engineering principle: procedural skills should be runnable, not just readable.
-	// A skill whose body carries a shell fence also gets an executable run.sh next to it.
-	if script := extractShellScript(g.Body); script != "" {
-		scriptPath := filepath.Join(dir, "run.sh")
-		if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env bash\nset -euo pipefail\n\n"+script+"\n"), 0o755); err != nil {
-			return "", err
-		}
-		body += "\n\nRunnable: `" + filepath.Join(".cursor", "skills", "autoskills-"+slug(g.Title), "run.sh") + "`"
-	}
-
-	content := fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n\n%s\n", slug(g.Title), yamlEscape(g.Title), body)
-	return path, os.WriteFile(path, []byte(content), 0o644)
-}
-
-var shellFenceRe = regexp.MustCompile("(?s)```(?:bash|sh|zsh)\\n(.*?)```")
-
-// extractShellScript returns the concatenated shell fences from a skill body, or "" if none.
-func extractShellScript(body string) string {
-	var parts []string
-	for _, m := range shellFenceRe.FindAllStringSubmatch(body, -1) {
-		if s := strings.TrimSpace(m[1]); s != "" {
-			parts = append(parts, s)
-		}
-	}
-	return strings.Join(parts, "\n\n")
+// repoSkillContent renders an on-demand skill file. Shell fences in the body stay what they are —
+// inert Markdown a human reads and runs deliberately. AutoSkills used to extract them into an
+// executable run.sh (0755) next to the skill; that turned model-authored text into a program on
+// disk and was removed in HOK-539. No artifact this package writes is executable.
+func repoSkillContent(g store.Suggestion) string {
+	return fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n\n%s\n", slug(g.Title), yamlEscape(g.Title), g.Body)
 }
 
 // AGENTS.md layout: all autoskills content lives inside ONE managed section, grouped by skill
@@ -204,11 +189,15 @@ func groupForSignal(signal string) string {
 	}
 }
 
-func writeAgentsBlock(g store.Suggestion) (string, error) {
-	path := filepath.Join(g.RepoRoot, "AGENTS.md")
+// planAgentsBlock computes the managed section and its two bounded secondary effects — skills
+// demoted under .cursor when the section overflows, and an import line appended to an existing
+// CLAUDE.md. All three are parts of one mutation, so they commit together and roll back together.
+func planAgentsBlock(g store.Suggestion, plan Plan) (Mutation, error) {
+	path := plan.Path
+	root := plan.Root
 	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
-		return "", err
+		return Mutation{}, err
 	}
 	content := string(existing)
 
@@ -230,10 +219,13 @@ func writeAgentsBlock(g store.Suggestion) (string, error) {
 	if id == "" {
 		id = g.ID
 		// distiller-proposed amendments ("amend: X") carry no BlockID — resolve the target by
-		// title so they rewrite the existing block instead of silently duplicating it
+		// title so they rewrite the existing block instead of silently duplicating it. The walk
+		// follows `order`, not the map: two blocks sharing a title must resolve to the same one on
+		// every run, or the same input would produce two different mutations.
 		if t, isAmend := strings.CutPrefix(g.Title, "amend: "); isAmend {
-			for _, b := range blocks {
-				if strings.EqualFold(BlockTitle(b.Body), strings.TrimSpace(t)) {
+			for _, candidate := range order {
+				b, ok := blocks[candidate]
+				if ok && strings.EqualFold(BlockTitle(b.Body), strings.TrimSpace(t)) {
 					id = b.ID
 					break
 				}
@@ -256,6 +248,8 @@ func writeAgentsBlock(g store.Suggestion) (string, error) {
 		}
 	}
 
+	mut := Mutation{WrittenPath: path}
+
 	// budget enforcement: demote lowest-confidence blocks to on-demand skill files until the
 	// section fits. The just-written block is exempt — the human explicitly chose it.
 	section := renderSection(blocks, order)
@@ -264,9 +258,12 @@ func writeAgentsBlock(g store.Suggestion) (string, error) {
 		if !ok {
 			break
 		}
-		if _, err := demoteToSkillFile(g.RepoRoot, victim); err != nil {
-			return "", fmt.Errorf("demote %s: %w", victim.ID, err)
+		op, notice, err := demotionOp(root, victim)
+		if err != nil {
+			return Mutation{}, fmt.Errorf("demote %s: %w", victim.ID, err)
 		}
+		mut.Ops = append(mut.Ops, op)
+		mut.Notices = append(mut.Notices, notice)
 		delete(blocks, victim.ID)
 		section = renderSection(blocks, order)
 	}
@@ -279,12 +276,16 @@ func writeAgentsBlock(g store.Suggestion) (string, error) {
 		content = "# AGENTS.md\n"
 	}
 	content += "\n" + section
+	mut.Ops = append(mut.Ops, FileOp{Root: root, Path: path, Content: content})
 
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return "", err
+	op, needed, err := claudeImportOp(root)
+	if err != nil {
+		return Mutation{}, err
 	}
-	ensureClaudeImport(g.RepoRoot)
-	return path, nil
+	if needed {
+		mut.Ops = append(mut.Ops, op)
+	}
+	return mut, nil
 }
 
 func renderSection(blocks map[string]Block, order []string) string {
@@ -311,6 +312,10 @@ func renderSection(blocks map[string]Block, order []string) string {
 	return sb.String()
 }
 
+// lowestConfidence picks the block to demote. Confidence decides; block id breaks a tie. Without
+// that tie-break the choice came from Go's randomized map iteration, so two runs of the same
+// planning on the same repository could evict different skills — and a mutation that is not a
+// function of its input cannot be reviewed before it is applied, nor replayed after a crash.
 func lowestConfidence(blocks map[string]Block, exemptID string) (Block, bool) {
 	var victim Block
 	found := false
@@ -318,78 +323,125 @@ func lowestConfidence(blocks map[string]Block, exemptID string) (Block, bool) {
 		if b.ID == exemptID {
 			continue
 		}
-		if !found || b.Confidence < victim.Confidence {
+		if !found || b.Confidence < victim.Confidence || (b.Confidence == victim.Confidence && b.ID < victim.ID) {
 			victim, found = b, true
 		}
 	}
 	return victim, found
 }
 
-// demoteToSkillFile moves an over-budget block to an on-demand skill file so it stays
-// available without occupying always-on context.
-func demoteToSkillFile(repoRoot string, b Block) (string, error) {
+// demotionOp moves an over-budget block to an on-demand skill file so it stays available without
+// occupying always-on context. The destination is confined here and again at mutation time.
+func demotionOp(repoRoot string, b Block) (FileOp, string, error) {
 	title := BlockTitle(b.Body)
 	if title == "" {
 		title = b.ID
 	}
 	dir := filepath.Join(repoRoot, ".cursor", "skills", "autoskills-"+slug(title))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
 	path := filepath.Join(dir, "SKILL.md")
+	if err := confine(repoRoot, path); err != nil {
+		return FileOp{}, "", err
+	}
 	body := strings.TrimSpace(strings.TrimPrefix(b.Body, "#### "+title))
 	content := fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n\n%s\n\n<!-- autoskills:demoted id=%s reason=section-budget -->\n", slug(title), yamlEscape(title), body, b.ID)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return "", err
-	}
-	fmt.Fprintf(os.Stderr, "  budget: demoted %q to %s\n", title, path)
-	return path, nil
+	return FileOp{Root: repoRoot, Path: path, Content: content},
+		fmt.Sprintf("  budget: demoted %q to %s\n", title, path), nil
 }
 
-// Remove undoes an accepted suggestion's artifact. AGENTS.md blocks are pruned from the
-// managed section; standalone files are deleted.
-func Remove(g store.Suggestion) error {
-	if g.WrittenPath == "" {
-		return nil
-	}
-	if filepath.Base(g.WrittenPath) == "AGENTS.md" {
-		gg := g
-		gg.Body = "" // empty body = prune
-		_, err := writeAgentsBlock(gg)
+// removeUnjournaled deletes an accepted suggestion's artifact. Like writeUnjournaled it is atomic
+// but not durable, unexported, and has no production caller: Undo is the only way in, and it
+// compensates the journaled acceptance instead of recomputing a deletion.
+func removeUnjournaled(g store.Suggestion) error {
+	mut, err := BuildRemoval(g)
+	if err != nil {
 		return err
 	}
-	if err := os.Remove(g.WrittenPath); err != nil && !os.IsNotExist(err) {
+	if err := capture(&mut); err != nil {
 		return err
 	}
-	dir := filepath.Dir(g.WrittenPath)
-	// skill dirs may also carry an emitted run.sh — remove it before the empty-dir tidy,
-	// but only inside directories we own (autoskills- prefix), never a user's dir
-	if strings.HasPrefix(filepath.Base(dir), "autoskills-") {
-		_ = os.Remove(filepath.Join(dir, "run.sh"))
-	}
-	if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
-		_ = os.Remove(dir)
+	if err := applyOps(&mut); err != nil {
+		if uErr := unwind(&mut); uErr != nil {
+			return fmt.Errorf("%w; %v", err, uErr)
+		}
+		return err
 	}
 	return nil
 }
 
-// ensureClaudeImport makes an existing CLAUDE.md pick up AGENTS.md content via the official
-// @import syntax. Only touches CLAUDE.md if it already exists and lacks any AGENTS.md reference.
-func ensureClaudeImport(repoRoot string) {
+// BuildRemoval computes the mutation that undoes an accepted suggestion. AGENTS.md blocks are
+// pruned from the managed section; standalone files are deleted.
+//
+// A stored path is data, not authority — and that holds for the SHAPE of the removal as much as
+// for its target. Which of the two shapes applies is decided by the plan recomputed from the
+// suggestion, never by what written_path happens to be named: routing on the stored basename let
+// a tampered row aim a `skill` suggestion at the repository's AGENTS.md, a file that suggestion
+// never wrote. A standalone removal then refuses anything that is not exactly the artifact this
+// suggestion produces, so a stale or tampered path cannot aim a deletion at an unrelated file
+// either.
+func BuildRemoval(g store.Suggestion) (Mutation, error) {
+	if g.WrittenPath == "" {
+		return Mutation{}, nil
+	}
+	plan, err := BuildPlan(g)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if plan.Kind == KindAgentsBlock {
+		gg := g
+		gg.Body = "" // empty body = prune
+		prunePlan, err := BuildPlan(gg)
+		if err != nil {
+			return Mutation{}, err
+		}
+		return planAgentsBlock(gg, prunePlan)
+	}
+	if filepath.Clean(g.WrittenPath) != filepath.Clean(plan.Path) {
+		return Mutation{}, fmt.Errorf("writer: refusing to remove %q: this suggestion's artifact is %q", clip(g.WrittenPath), clip(plan.Path))
+	}
+	mut := Mutation{Ops: []FileOp{{Root: plan.Root, Path: plan.Path, Remove: true}}}
+	dir := filepath.Dir(plan.Path)
+	// older versions emitted an executable run.sh next to a skill (removed in HOK-539); undo must
+	// still clean one up when it exists, but only inside directories we own (autoskills- prefix)
+	if strings.HasPrefix(filepath.Base(dir), "autoskills-") {
+		mut.Ops = append(mut.Ops, FileOp{Root: plan.Root, Path: filepath.Join(dir, "run.sh"), Remove: true})
+	}
+	// the now-empty `autoskills-<slug>` directory is left where it is. Removing a directory needs
+	// proof that this operation created it and that nothing else has since been put inside, and a
+	// manifest written before the mutation cannot carry the second half across a crash. An empty
+	// directory is untidy; deleting one the user had put something in is not recoverable.
+	return mut, nil
+}
+
+// claudeImportOp makes an existing CLAUDE.md pick up AGENTS.md content via the official @import
+// syntax. It reports no operation unless CLAUDE.md already exists and lacks any AGENTS.md
+// reference — and refuses outright when the file is a link out of the repository, before the
+// AGENTS.md write it accompanies is planned.
+func claudeImportOp(repoRoot string) (FileOp, bool, error) {
 	path := filepath.Join(repoRoot, "CLAUDE.md")
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return FileOp{}, false, nil
+	} else if err != nil {
+		return FileOp{}, false, err
+	}
+	if err := confine(repoRoot, path); err != nil {
+		return FileOp{}, false, err
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return FileOp{}, false, nil
+		}
+		return FileOp{}, false, err
 	}
 	if strings.Contains(string(raw), "AGENTS.md") {
-		return
+		return FileOp{}, false, nil
 	}
 	content := string(raw)
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
 	content += "\n@AGENTS.md\n"
-	_ = os.WriteFile(path, []byte(content), 0o644)
+	return FileOp{Root: repoRoot, Path: path, Content: content}, true, nil
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
