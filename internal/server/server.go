@@ -4,6 +4,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -80,8 +81,10 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Action {
 	case "reject":
-		if err := s.Store.Decide(id, "rejected", "", ""); err != nil {
-			writeErr(w, err)
+		// the status check above is a courtesy: Reject is a compare-and-set from pending inside a
+		// transaction, so a rejection racing an acceptance loses instead of contradicting it
+		if err := s.Store.Reject(id); err != nil {
+			writeDecisionErr(w, err)
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true})
@@ -96,13 +99,12 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		written, err := writer.Write(g)
+		// Accept journals the mutation, writes the files, then records the decision in the same
+		// transaction that closes the journal entry — the status above is a courtesy 409, the
+		// binding pending-only check happens inside that transaction.
+		written, err := writer.Accept(s.Store, g)
 		if err != nil {
-			writeErr(w, fmt.Errorf("write skill: %w", err))
-			return
-		}
-		if err := s.Store.Decide(id, "accepted", req.Body, written); err != nil {
-			writeErr(w, err)
+			writeDecisionErr(w, fmt.Errorf("write skill: %w", err))
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true, "writtenPath": written})
@@ -165,4 +167,20 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func writeErr(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// writeDecisionErr separates "you lost a race" from "something broke". Both clients of a contested
+// suggestion must be able to tell those apart: one reloads and decides again, the other has a bug
+// or a broken database to report. Losing a compare-and-set, hitting an unfinished operation, and
+// finding a destination changed underneath a manifest are all the first kind.
+func writeDecisionErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotPending),
+		errors.Is(err, store.ErrOperationInFlight),
+		errors.Is(err, store.ErrResourceBusy),
+		errors.Is(err, writer.ErrConflict):
+		http.Error(w, err.Error(), http.StatusConflict)
+	default:
+		writeErr(w, err)
+	}
 }
