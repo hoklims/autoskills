@@ -81,6 +81,15 @@ func TestCLIHelper(t *testing.T) {
 	case "not-logged-in":
 		_, _ = fmt.Fprint(os.Stderr, "Not logged in; run /login")
 		os.Exit(7)
+	case "authentication-required":
+		_, _ = fmt.Fprint(os.Stderr, "authentication required")
+		os.Exit(7)
+	case "claude-auth-json":
+		_, _ = fmt.Fprint(os.Stdout, `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Not logged in · Please run /login"}`)
+		os.Exit(7)
+	case "claude-prompt-auth-json":
+		_, _ = fmt.Fprint(os.Stdout, `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"authentication required in private prompt"}`)
+		os.Exit(8)
 	case "request-error":
 		_, _ = fmt.Fprint(os.Stderr, "SYSTEM INSTRUCTIONS:\nsystem instruction\nUSER MESSAGE:\nauthentication required in private prompt\nERROR: {\n  \"error\": {\n    \"message\": \"schema rejected\"\n  }\n}\n")
 		os.Exit(8)
@@ -556,13 +565,19 @@ func TestCLIProviderWorksFromFilesystemRoot(t *testing.T) {
 }
 
 func TestCLIErrorKeepsCauseWithoutEchoingPrompt(t *testing.T) {
+	var builder outbound.Builder
+	builder.Data("authentication required in private prompt", 0)
+	payload, err := builder.BuildWithOutputSchema("system", testOutputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, provider := range map[string]Provider{
 		"codex":  newTestCodexProvider(t, "", time.Second),
 		"claude": newClaudeProvider(helperCommand(), "", time.Second),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("AUTOSKILLS_CLI_HELPER", "request-error")
-			_, err := provider.Generate(context.Background(), preparedPayload(t))
+			_, err := provider.Generate(context.Background(), payload)
 			if err == nil || !strings.Contains(err.Error(), "schema rejected") {
 				t.Fatalf("error = %v", err)
 			}
@@ -570,6 +585,38 @@ func TestCLIErrorKeepsCauseWithoutEchoingPrompt(t *testing.T) {
 				t.Fatalf("prompt text caused false authentication classification: %v", err)
 			}
 			if strings.Contains(err.Error(), "SYSTEM INSTRUCTIONS") || strings.Contains(err.Error(), "private prompt") {
+				t.Fatalf("error echoed prompt: %v", err)
+			}
+		})
+	}
+}
+
+func TestCLIAuthenticationClassificationDoesNotEchoPrompt(t *testing.T) {
+	for _, tc := range []struct {
+		behavior string
+		prompt   string
+		wantAuth bool
+	}{
+		{behavior: "authentication-required", prompt: "authentication guidance", wantAuth: true},
+		{behavior: "claude-auth-json", prompt: "private project context", wantAuth: true},
+		{behavior: "claude-prompt-auth-json", prompt: "authentication required in private prompt", wantAuth: false},
+	} {
+		t.Run(tc.behavior, func(t *testing.T) {
+			t.Setenv("AUTOSKILLS_CLI_HELPER", tc.behavior)
+			var builder outbound.Builder
+			builder.Data(tc.prompt, 0)
+			payload, err := builder.BuildWithOutputSchema("system", testOutputSchema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), payload)
+			if err == nil {
+				t.Fatal("expected provider error")
+			}
+			if errors.Is(err, ErrNotAuthenticated) != tc.wantAuth {
+				t.Fatalf("error = %v, want authentication classification %v", err, tc.wantAuth)
+			}
+			if strings.Contains(err.Error(), tc.prompt) {
 				t.Fatalf("error echoed prompt: %v", err)
 			}
 		})

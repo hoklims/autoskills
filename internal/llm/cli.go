@@ -38,6 +38,14 @@ type cliProvider struct {
 	timeout time.Duration
 }
 
+type claudeEnvelope struct {
+	Type             string          `json:"type"`
+	Subtype          string          `json:"subtype"`
+	IsError          bool            `json:"is_error"`
+	Result           string          `json:"result"`
+	StructuredOutput json.RawMessage `json:"structured_output"`
+}
+
 func NewCodex(model string) (Provider, error) {
 	path, err := exec.LookPath("codex")
 	if err != nil {
@@ -148,13 +156,7 @@ func (p *cliProvider) generateClaude(ctx context.Context, dir string, payload ou
 	if err != nil {
 		return "", err
 	}
-	var envelope struct {
-		Type             string          `json:"type"`
-		Subtype          string          `json:"subtype"`
-		IsError          bool            `json:"is_error"`
-		Result           string          `json:"result"`
-		StructuredOutput json.RawMessage `json:"structured_output"`
-	}
+	var envelope claudeEnvelope
 	if err := json.Unmarshal(stdout, &envelope); err != nil {
 		return "", fmt.Errorf("%w from claude: %v", ErrInvalidOutput, err)
 	}
@@ -188,10 +190,10 @@ func (p *cliProvider) run(ctx context.Context, dir string, args []string, stdin 
 	}
 	if err != nil {
 		sanitizedStderr := outbound.Sanitize(stderr.String())
-		detail := safeCLIDetail(sanitizedStderr, stdin)
-		if looksUnauthenticated(detail) {
+		if cliFailureLooksUnauthenticated(p.kind, sanitizedStderr, stdout.Bytes(), stdin) {
 			return nil, fmt.Errorf("%w: %s", ErrNotAuthenticated, p.kind)
 		}
+		detail := safeCLIDetail(sanitizedStderr, stdin)
 		if detail == "" {
 			return nil, fmt.Errorf("llm: %s exited non-zero: %w", p.kind, err)
 		}
@@ -457,13 +459,7 @@ func pathWithin(root, target string) bool {
 func safeCLIDetail(stderr, prompt string) string {
 	lines := strings.Split(stderr, "\n")
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, `"message":`) {
-			continue
-		}
-		encoded := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(trimmed, `"message":`)), ",")
-		var message string
-		if json.Unmarshal([]byte(encoded), &message) == nil && !detailContainsPromptData(message, prompt) {
+		if message, ok := jsonMessage(line); ok && !detailContainsPromptData(message, prompt) {
 			return limitRunes(message, 500)
 		}
 	}
@@ -475,6 +471,51 @@ func safeCLIDetail(stderr, prompt string) string {
 		}
 	}
 	return ""
+}
+
+func cliFailureLooksUnauthenticated(kind, stderr string, stdout []byte, prompt string) bool {
+	if containsUnauthenticatedDiagnostic(stderr, prompt) {
+		return true
+	}
+	if kind != "claude" {
+		return false
+	}
+	var envelope claudeEnvelope
+	if json.Unmarshal(stdout, &envelope) != nil || envelope.Type != "result" || !envelope.IsError {
+		return false
+	}
+	return containsUnauthenticatedDiagnostic(outbound.Sanitize(envelope.Result), prompt)
+}
+
+func containsUnauthenticatedDiagnostic(output, prompt string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		candidate := strings.TrimSpace(line)
+		if message, ok := jsonMessage(line); ok {
+			candidate = message
+		}
+		if looksUnauthenticated(candidate) && !promptContainsDiagnostic(prompt, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonMessage(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, `"message":`) {
+		return "", false
+	}
+	encoded := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(trimmed, `"message":`)), ",")
+	var message string
+	if json.Unmarshal([]byte(encoded), &message) != nil {
+		return "", false
+	}
+	return message, true
+}
+
+func promptContainsDiagnostic(prompt, diagnostic string) bool {
+	diagnostic = strings.TrimSpace(diagnostic)
+	return diagnostic != "" && strings.Contains(strings.ToLower(prompt), strings.ToLower(diagnostic))
 }
 
 func detailContainsPromptData(detail, prompt string) bool {
