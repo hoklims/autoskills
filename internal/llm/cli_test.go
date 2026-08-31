@@ -516,6 +516,18 @@ func TestCLIProviderRefusesTemporaryDirectoryInsideCallerTree(t *testing.T) {
 	}
 }
 
+func TestCLIProviderWorksFromFilesystemRoot(t *testing.T) {
+	t.Setenv("AUTOSKILLS_CLI_HELPER", "success")
+	t.Chdir(filepath.VolumeName(string(filepath.Separator)) + string(filepath.Separator))
+	out, err := newClaudeProvider(helperCommand(), "", time.Second).Generate(context.Background(), preparedPayload(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeInvocation(t, out).Dir; !strings.Contains(filepath.Base(got), "autoskills-llm-") {
+		t.Fatalf("working directory is not neutral: %q", got)
+	}
+}
+
 func TestCLIErrorKeepsCauseWithoutEchoingPrompt(t *testing.T) {
 	for name, provider := range map[string]Provider{
 		"codex":  newTestCodexProvider(t, "", time.Second),

@@ -375,7 +375,10 @@ func neutralWorkingDirectory(excludedRoots []string) (string, error) {
 		_ = os.RemoveAll(createdDir)
 		return "", fmt.Errorf("llm: resolve neutral working directory: %w", err)
 	}
-	roots := append(append([]string{}, excludedRoots...), callerDir)
+	roots := append([]string{}, excludedRoots...)
+	if filepath.Dir(callerDir) != callerDir {
+		roots = append(roots, callerDir)
+	}
 	for _, root := range roots {
 		resolvedRoot, resolveErr := filepath.EvalSymlinks(root)
 		if resolveErr != nil {
