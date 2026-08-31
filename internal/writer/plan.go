@@ -39,8 +39,12 @@ var managedMarkers = []string{"autoskills:begin", "autoskills:end", "autoskills:
 // Write refuses to act without one, so the review UI's preview and the actual mutation are the
 // same decision made twice.
 type Plan struct {
-	Kind    Kind
-	Path    string // absolute destination
+	Kind Kind
+	Path string // absolute destination
+	// Root is the only directory this plan is allowed to touch. It travels with the plan into the
+	// journal so the confinement check can be repeated at mutation time against the same authority
+	// that authorized it, not against a root re-derived from a possibly-tampered row.
+	Root    string
 	Rel     string // repo-relative (or ~-relative) preview
 	BlockID string // managed block this plan targets, for AGENTS.md kinds
 	Prune   bool   // true when the plan removes a managed block instead of writing content
@@ -105,7 +109,7 @@ func BuildPlan(g store.Suggestion) (Plan, error) {
 		if err := confine(root, path); err != nil {
 			return Plan{}, err
 		}
-		return Plan{Kind: KindMachineSkill, Path: path, Rel: "~/.autoskills/skills/" + slug(title) + ".md"}, nil
+		return Plan{Kind: KindMachineSkill, Path: path, Root: root, Rel: "~/.autoskills/skills/" + slug(title) + ".md"}, nil
 	}
 
 	root := g.RepoRoot
@@ -136,7 +140,7 @@ func BuildPlan(g store.Suggestion) (Plan, error) {
 		if placement == "skill" {
 			kind = KindRepoSkill
 		}
-		return Plan{Kind: kind, Path: path, Rel: filepath.ToSlash(rel)}, nil
+		return Plan{Kind: kind, Path: path, Root: root, Rel: filepath.ToSlash(rel)}, nil
 	}
 
 	// always_on: a managed block inside the repo's AGENTS.md
@@ -152,7 +156,7 @@ func BuildPlan(g store.Suggestion) (Plan, error) {
 	if !prune && title == "" {
 		return Plan{}, fmt.Errorf("writer: an AGENTS.md block needs a title")
 	}
-	return Plan{Kind: KindAgentsBlock, Path: path, Rel: "AGENTS.md", BlockID: strings.TrimSpace(g.BlockID), Prune: prune}, nil
+	return Plan{Kind: KindAgentsBlock, Path: path, Root: root, Rel: "AGENTS.md", BlockID: strings.TrimSpace(g.BlockID), Prune: prune}, nil
 }
 
 // TargetPreview returns the destination Write would choose, so pending suggestions can show an
@@ -254,9 +258,18 @@ func canonicalPath(path string) (string, error) {
 	}
 }
 
+// clip bounds a path or token quoted in an error message. It keeps BOTH ends, because the tail of
+// a path is what names the file: truncating from the right turns "these files were left as they
+// are" into a directory prefix the operator cannot act on, and a rollback that stops has to say
+// exactly what it stopped on.
 func clip(s string) string {
-	if len(s) > 80 {
-		return s[:80] + "…"
+	const (
+		max  = 80
+		head = 24
+	)
+	r := []rune(s)
+	if len(r) <= max {
+		return s
 	}
-	return s
+	return string(r[:head]) + "…" + string(r[len(r)-(max-head-1):])
 }
