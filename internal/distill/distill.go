@@ -53,9 +53,11 @@ Language: transcripts may be in any language, and user prompts may be messy, typ
 Respond with ONLY a JSON object, no markdown fences:
 {"suggestions":[{"title":"...","signal":"correction|rediscovery|failure_fix|convention|workflow","sensitivity":false,"confidence":0.0,"body":"...","rationale":"...","evidence":["verbatim excerpt 1"]}]}`
 
+const suggestionOutputSchema = `{"type":"object","properties":{"suggestions":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"signal":{"type":"string","enum":["correction","rediscovery","failure_fix","convention","workflow"]},"sensitivity":{"type":"boolean"},"confidence":{"type":"number"},"body":{"type":"string"},"rationale":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}}},"required":["title","signal","sensitivity","confidence","body","rationale","evidence"],"additionalProperties":false}}},"required":["suggestions"],"additionalProperties":false}`
+
 type Distiller struct {
-	Client *llm.Client
-	Store  *store.Store
+	Provider llm.Provider
+	Store    *store.Store
 	// MaxPerSession caps suggestions per session before the global scan cap applies.
 	MaxPerSession int
 	MinConfidence float64
@@ -106,7 +108,7 @@ func (d *Distiller) Session(ctx context.Context, sess *canon.Session) ([]store.S
 	b.Data(transcript, 0)
 	b.Static("\n</transcript>\n\nTASK: You are the AutoSkills distiller. Extract durable skills from the transcript above per your system instructions (five signal types, verbatim evidence, brutal quality bar — empty list is a fine outcome). Respond with ONLY the JSON object, starting with {.")
 
-	payload, err := b.Build(systemPrompt)
+	payload, err := b.BuildWithOutputSchema(systemPrompt, suggestionOutputSchema, sess.RepoRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +122,7 @@ func (d *Distiller) Session(ctx context.Context, sess *canon.Session) ([]store.S
 		d.SeenContent.Add(key, true)
 	}
 
-	out, err := d.Client.Chat(ctx, payload)
+	out, err := d.Provider.Generate(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -132,13 +134,13 @@ func (d *Distiller) Session(ctx context.Context, sess *canon.Session) ([]store.S
 	if err := decodeStrictJSON(out, &resp, "suggestions"); err != nil {
 		// One corrective retry: some models (especially local ones) ramble before complying.
 		b.Static("\n\nREMINDER: respond with ONLY the JSON object, starting with { — no thinking, no prose, no fences.")
-		retryPayload, buildErr := b.Build(systemPrompt)
+		retryPayload, buildErr := b.BuildWithOutputSchema(systemPrompt, suggestionOutputSchema, sess.RepoRoot)
 		if buildErr != nil {
 			return nil, fmt.Errorf("distill: model returned unparseable JSON: %w", err)
 		}
-		out, retryErr := d.Client.Chat(ctx, retryPayload)
+		out, retryErr := d.Provider.Generate(ctx, retryPayload)
 		if retryErr != nil {
-			return nil, fmt.Errorf("distill: model returned unparseable JSON: %w", err)
+			return nil, fmt.Errorf("distill: corrective retry after unparseable JSON failed: %w", retryErr)
 		}
 		if err2 := decodeStrictJSON(out, &resp, "suggestions"); err2 != nil {
 			return nil, fmt.Errorf("distill: model returned unparseable JSON after retry: %w", err2)

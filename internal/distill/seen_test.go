@@ -26,7 +26,7 @@ func TestSeenContentSkipsDuplicateLLMCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &Distiller{
-		Client:      client,
+		Provider:    client,
 		SeenContent: cache.New[string, bool](16),
 	}
 	s := &canon.Session{
